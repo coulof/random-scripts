@@ -9,6 +9,18 @@ A collection of utility scripts for Git automation, Homebrew setup, and SUSE/Har
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
 *   **[git-gc-all](./git-gc-all)**: Performs garbage collection across multiple repositories.
 
+## Usage: `get-harvester-kernel.sh`
+
+Extracts the kernel version from a Harvester release squashfs image without needing to deploy an active node. Downloads the squashfs rootfs, extracts `/lib/modules`, and reads the directory name.
+
+```bash
+# Extract kernel version from Harvester v1.7.0 (defaults to amd64)
+./get-harvester-kernel.sh v1.7.0
+
+# Extract kernel version from Harvester v1.2.2 for arm64 architecture
+./get-harvester-kernel.sh v1.2.2 arm64
+```
+
 ## Usage: `git-all`
 
 The `git-all` script runs specified Git operations on all Git repositories found recursively under a target directory.
