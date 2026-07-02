@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# git-pull-all — run `git pull` on every git repo found under a directory
+#
+# Usage:
+#   git-pull-all [directory]            # defaults to current directory
+#   git-pull-all -n [directory]         # dry-run, just list repos found
+#   git-pull-all -s [directory]         # skip repos with uncommitted changes
+#
+set -euo pipefail
+
+DRY_RUN=0
+SKIP_DIRTY=0
+
+while getopts "ns" opt; do
+  case "$opt" in
+    n) DRY_RUN=1 ;;
+    s) SKIP_DIRTY=1 ;;
+    *) echo "Usage: $0 [-n] [-s] [directory]" >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+ROOT="${1:-.}"
+
+if [ ! -d "$ROOT" ]; then
+  echo "Error: '$ROOT' is not a directory" >&2
+  exit 1
+fi
+
+count=0
+ok=0
+skipped=0
+failed=0
+failed_repos=()
+
+while IFS= read -r -d '' gitdir; do
+  repo="$(dirname "$gitdir")"
+  count=$((count + 1))
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "$repo"
+    continue
+  fi
+
+  echo "== $repo =="
+
+  if [ "$SKIP_DIRTY" -eq 1 ] && [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    echo "   skipped (uncommitted changes)"
+    skipped=$((skipped + 1))
+    echo
+    continue
+  fi
+
+  if git -C "$repo" pull --ff-only 2>&1 | sed 's/^/   /'; then
+    ok=$((ok + 1))
+  else
+    failed=$((failed + 1))
+    failed_repos+=("$repo")
+  fi
+  echo
+done < <(find "$ROOT" -type d -name ".git" -print0)
+
+if [ "$count" -eq 0 ]; then
+  echo "No git repositories found under '$ROOT'"
+  exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "Found $count repo(s) under '$ROOT'"
+  exit 0
+fi
+
+echo "Done. $count repo(s) found: $ok pulled, $skipped skipped, $failed failed."
+if [ "$failed" -gt 0 ]; then
+  echo "Failed:"
+  printf '  - %s\n' "${failed_repos[@]}"
+  exit 1
+fi

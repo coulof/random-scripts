@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+#
+# git-all — run a git operation on every repo found under a directory
+#
+# Usage:
+#   git-all pull [directory]            # pull every repo (fast-forward only)
+#   git-all pull -n [directory]         # dry-run, just list repos found
+#   git-all pull -s [directory]         # skip repos with uncommitted changes
+#
+#   git-all gc [directory]              # gc every repo
+#   git-all gc -a [directory]           # aggressive gc (slower, smaller)
+#   git-all gc -n [directory]           # dry-run, just list repos found
+#
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 <pull|gc> [-n] [-s|-a] [directory]" >&2
+  exit 1
+}
+
+[ $# -ge 1 ] || usage
+CMD="$1"; shift
+
+case "$CMD" in
+  pull|gc) ;;
+  *) usage ;;
+esac
+
+DRY_RUN=0
+SKIP_DIRTY=0
+AGGRESSIVE=0
+
+while getopts "nsa" opt; do
+  case "$opt" in
+    n) DRY_RUN=1 ;;
+    s) [ "$CMD" = "pull" ] || usage; SKIP_DIRTY=1 ;;
+    a) [ "$CMD" = "gc" ] || usage; AGGRESSIVE=1 ;;
+    *) usage ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+ROOT="${1:-.}"
+
+if [ ! -d "$ROOT" ]; then
+  echo "Error: '$ROOT' is not a directory" >&2
+  exit 1
+fi
+
+find_repos() {
+  find "$ROOT" -type d -name ".git" -print0
+}
+
+count=0
+
+run_pull() {
+  local ok=0 skipped=0 failed=0
+  local failed_repos=()
+
+  while IFS= read -r -d '' gitdir; do
+    local repo; repo="$(dirname "$gitdir")"
+    count=$((count + 1))
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "$repo"
+      continue
+    fi
+
+    echo "== $repo =="
+
+    if [ "$SKIP_DIRTY" -eq 1 ] && [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+      echo "   skipped (uncommitted changes)"
+      skipped=$((skipped + 1))
+      echo
+      continue
+    fi
+
+    if git -C "$repo" pull --ff-only 2>&1 | sed 's/^/   /'; then
+      ok=$((ok + 1))
+    else
+      failed=$((failed + 1))
+      failed_repos+=("$repo")
+    fi
+    echo
+  done < <(find_repos)
+
+  [ "$count" -eq 0 ] && { echo "No git repositories found under '$ROOT'"; return 0; }
+  [ "$DRY_RUN" -eq 1 ] && { echo "Found $count repo(s) under '$ROOT'"; return 0; }
+
+  echo "Done. $count repo(s) found: $ok pulled, $skipped skipped, $failed failed."
+  if [ "$failed" -gt 0 ]; then
+    echo "Failed:"
+    printf '  - %s\n' "${failed_repos[@]}"
+    return 1
+  fi
+}
+
+run_gc() {
+  local gc_args=(--prune=now)
+  [ "$AGGRESSIVE" -eq 1 ] && gc_args+=(--aggressive)
+  local total_before=0 total_after=0
+
+  while IFS= read -r -d '' gitdir; do
+    local repo; repo="$(dirname "$gitdir")"
+    count=$((count + 1))
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+      echo "$repo"
+      continue
+    fi
+
+    local size_before size_after saved
+    size_before=$(du -sk "$gitdir" | cut -f1)
+
+    echo "== $repo =="
+    git -C "$repo" gc "${gc_args[@]}"
+
+    size_after=$(du -sk "$gitdir" | cut -f1)
+    total_before=$((total_before + size_before))
+    total_after=$((total_after + size_after))
+    saved=$((size_before - size_after))
+    echo "   ${size_before}K -> ${size_after}K (saved ${saved}K)"
+    echo
+  done < <(find_repos)
+
+  [ "$count" -eq 0 ] && { echo "No git repositories found under '$ROOT'"; return 0; }
+  [ "$DRY_RUN" -eq 1 ] && { echo "Found $count repo(s) under '$ROOT'"; return 0; }
+
+  local total_saved=$((total_before - total_after))
+  echo "Done. $count repo(s) processed. Total: ${total_before}K -> ${total_after}K (saved ${total_saved}K)"
+}
+
+case "$CMD" in
+  pull) run_pull ;;
+  gc) run_gc ;;
+esac

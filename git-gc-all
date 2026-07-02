@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+#
+# git-gc-all — run `git gc` on every git repo found under a directory
+#
+# Usage:
+#   git-gc-all [directory]              # defaults to current directory
+#   git-gc-all -a [directory]           # aggressive gc (slower, smaller)
+#   git-gc-all -n [directory]           # dry-run, just list repos found
+#
+set -euo pipefail
+
+AGGRESSIVE=0
+DRY_RUN=0
+
+while getopts "an" opt; do
+  case "$opt" in
+    a) AGGRESSIVE=1 ;;
+    n) DRY_RUN=1 ;;
+    *) echo "Usage: $0 [-a] [-n] [directory]" >&2; exit 1 ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+ROOT="${1:-.}"
+
+if [ ! -d "$ROOT" ]; then
+  echo "Error: '$ROOT' is not a directory" >&2
+  exit 1
+fi
+
+GC_ARGS=(--prune=now)
+[ "$AGGRESSIVE" -eq 1 ] && GC_ARGS+=(--aggressive)
+
+count=0
+total_before=0
+total_after=0
+
+while IFS= read -r -d '' gitdir; do
+  repo="$(dirname "$gitdir")"
+  count=$((count + 1))
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    echo "$repo"
+    continue
+  fi
+
+  size_before=$(du -sk "$gitdir" | cut -f1)
+
+  echo "== $repo =="
+  git -C "$repo" gc "${GC_ARGS[@]}"
+
+  size_after=$(du -sk "$gitdir" | cut -f1)
+  total_before=$((total_before + size_before))
+  total_after=$((total_after + size_after))
+
+  saved=$((size_before - size_after))
+  echo "   ${size_before}K -> ${size_after}K (saved ${saved}K)"
+  echo
+done < <(find "$ROOT" -type d -name ".git" -print0)
+
+if [ "$count" -eq 0 ]; then
+  echo "No git repositories found under '$ROOT'"
+  exit 0
+fi
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "Found $count repo(s) under '$ROOT'"
+else
+  total_saved=$((total_before - total_after))
+  echo "Done. $count repo(s) processed. Total: ${total_before}K -> ${total_after}K (saved ${total_saved}K)"
+fi
