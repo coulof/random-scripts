@@ -1,1 +1,2 @@
 brew "squashfs"
+brew "rpm"
