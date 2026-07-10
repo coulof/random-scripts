@@ -1,0 +1,373 @@
+#!/usr/bin/env node
+// md2pdf — Markdown → PDF, no LaTeX, no root required
+// Features: KaTeX math ($...$, $$...$$), Mermaid diagrams, themed output
+//
+// Install:
+//   chmod +x md2pdf && mv md2pdf ~/.local/bin/md2pdf
+//
+// First run auto-installs md-to-pdf (~150 MB with bundled Chromium) into ~/.md2pdf/
+//
+// Usage:
+//   md2pdf input.md                     → input.pdf (same directory)
+//   md2pdf input.md output.pdf          → explicit output path
+//   md2pdf input.md --theme suse        → built-in SUSE brand theme
+//   md2pdf input.md --css custom.css    → extra CSS appended to theme
+//   md2pdf input.md --margins 20mm      → all margins (default: 15mm)
+//   md2pdf input.md --paper A4          → page format (default: A4)
+//   md2pdf input.md --landscape         → landscape orientation
+//   md2pdf input.md --no-math           → skip KaTeX (faster, fully offline)
+//   md2pdf input.md --no-diagrams       → skip Mermaid rendering
+//   md2pdf --list-themes
+
+"use strict";
+
+const path   = require("path");
+const fs     = require("fs");
+const { spawnSync } = require("child_process");
+const os     = require("os");
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const LIB_DIR = path.join(os.homedir(), ".md2pdf");
+const PKG     = "md-to-pdf@5.2.4";
+
+// ── KaTeX ─────────────────────────────────────────────────────────────────────
+// Injected via md-to-pdf's stylesheet[]/script[] → Puppeteer addStyleTag/addScriptTag.
+// Scripts run sequentially in order, so katex → auto-render → init is guaranteed.
+const KATEX_CDN = "https://cdn.jsdelivr.net/npm/katex@0.16.10/dist";
+
+const KATEX_STYLESHEET = `${KATEX_CDN}/katex.min.css`;
+const KATEX_SCRIPTS = [
+  { url: `${KATEX_CDN}/katex.min.js` },
+  { url: `${KATEX_CDN}/contrib/auto-render.min.js` },
+  {
+    content: `
+      renderMathInElement(document.body, {
+        delimiters: [
+          { left: '$$',    right: '$$',    display: true  },
+          { left: '$',     right: '$',     display: false },
+          { left: '\\\\[', right: '\\\\]', display: true  },
+          { left: '\\\\(', right: '\\\\)', display: false }
+        ],
+        throwOnError: false
+      });
+    `,
+  },
+];
+
+// ── Mermaid ───────────────────────────────────────────────────────────────────
+// Strategy:
+//   1. marked_extensions: intercept ```mermaid fenced blocks at parse time
+//      and emit <pre class="mermaid">…</pre> instead of <pre><code class="language-mermaid">
+//      Mermaid 11 uses querySelectorAll('pre.mermaid, .mermaid') as its default selector.
+//   2. Inject mermaid@11 via script[] and call mermaid.run() after DOM is ready.
+//   3. wait_until:'networkidle0' ensures diagrams are fully SVG-rendered before print.
+//
+// Mermaid 11 is ESM-only on npm but jsdelivr ships a UMD/IIFE bundle at /dist/mermaid.min.js
+// which exposes window.mermaid — that's what we use here.
+const MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist";
+
+const MERMAID_SCRIPTS = [
+  { url: `${MERMAID_CDN}/mermaid.min.js` },
+  // DOM safety net: if any mermaid block still rendered as <code class="language-mermaid">
+  // (e.g. via highlight.js fallback), convert it before mermaid.run() is called.
+  {
+    content: `
+      (function fixMermaidBlocks() {
+        document.querySelectorAll('code[class*="mermaid"], code[class*="language-mermaid"]').forEach(function(code) {
+          var pre = code.parentElement;
+          if (!pre || pre.tagName !== 'PRE') return;
+          var txt = code.innerHTML
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+          var newPre = document.createElement('pre');
+          newPre.className = 'mermaid';
+          newPre.textContent = txt;
+          pre.parentNode.replaceChild(newPre, pre);
+        });
+      })();
+    `,
+  },
+  {
+    content: `
+      mermaid.initialize({
+        startOnLoad: false,
+        theme: 'neutral',
+        themeVariables: { fontSize: '14px' }
+      });
+      // run() returns a Promise; networkidle0 waits for the async SVG render to settle
+      window.__mermaidReady = mermaid.run({ querySelector: 'pre.mermaid' });
+    `,
+  },
+];
+
+// marked extension: replaces \`\`\`mermaid … \`\`\` with <pre class="mermaid">…</pre>
+// so Mermaid's querySelector('pre.mermaid') finds it in the DOM.
+//
+// ROOT CAUSE FIX: marked 4.x (bundled in md-to-pdf 5.x) uses the THREE-ARGUMENT
+// renderer.code(code, lang, escaped) signature — NOT the token-object API of marked 5+.
+// Previous code used code(token) → token.lang was always undefined → guard never fired
+// → block fell through to default <pre><code class="language-mermaid"> rendering.
+const MERMAID_MARKED_EXTENSION = {
+  renderer: {
+    // marked 4.x: code = raw source string, lang = language tag string
+    // Do NOT re-escape: marked passes us the raw source text for mermaid blocks
+    // (highlight.js only runs for languages it recognises — not "mermaid").
+    code(code, lang) {
+      if (lang === "mermaid") {
+        return `<pre class="mermaid">${code}</pre>\n`;
+      }
+      return false;
+    },
+  },
+};
+
+// ── Themes ────────────────────────────────────────────────────────────────────
+const THEMES = {
+  default: `
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+           font-size: 13px; line-height: 1.6; color: #24292e; max-width: 860px; margin: 0 auto; }
+    h1, h2, h3, h4 { font-weight: 600; margin-top: 1.5em; margin-bottom: 0.5em; }
+    h1 { font-size: 2em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+    code { background: #f6f8fa; padding: 0.2em 0.4em; border-radius: 3px;
+           font-size: 85%; font-family: "SF Mono", Monaco, "Cascadia Code", monospace; }
+    pre  { background: #f6f8fa; padding: 16px; border-radius: 6px; overflow: auto; }
+    pre code { background: none; padding: 0; font-size: 90%; }
+    pre.mermaid { background: transparent; padding: 8px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th, td { border: 1px solid #dfe2e5; padding: 6px 13px; }
+    th { background: #f6f8fa; font-weight: 600; }
+    tr:nth-child(even) { background: #f6f8fa; }
+    blockquote { border-left: 4px solid #dfe2e5; color: #6a737d; margin: 0; padding: 0 1em; }
+    a { color: #0366d6; }
+    hr { border: none; border-top: 1px solid #eaecef; }
+    img { max-width: 100%; }
+  `,
+
+  suse: `
+    @import url('https://fonts.googleapis.com/css2?family=Source+Sans+Pro:wght@400;600;700&family=Source+Code+Pro&display=swap');
+    body { font-family: "Source Sans Pro", Arial, sans-serif; font-size: 13px;
+           line-height: 1.65; color: #1a1a1a; max-width: 860px; margin: 0 auto; }
+    h1 { font-size: 2em; color: #30ba78; border-bottom: 2px solid #30ba78; padding-bottom: 0.3em; }
+    h2 { font-size: 1.4em; color: #0c322c; border-bottom: 1px solid #30ba78; padding-bottom: 0.2em; }
+    h3 { font-size: 1.1em; color: #0c322c; }
+    code { background: #f0faf4; border: 1px solid #c8ecd8; padding: 0.15em 0.4em;
+           border-radius: 3px; font-size: 84%;
+           font-family: "Source Code Pro", "SF Mono", monospace; color: #0c322c; }
+    pre  { background: #0c322c; color: #e8f5ee; padding: 16px; border-radius: 6px; }
+    pre code { background: none; border: none; color: inherit; }
+    pre.mermaid { background: transparent; padding: 8px 0; }
+    table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+    th { background: #30ba78; color: white; padding: 8px 12px; }
+    td { border: 1px solid #c8ecd8; padding: 6px 12px; }
+    tr:nth-child(even) { background: #f0faf4; }
+    blockquote { border-left: 4px solid #30ba78; background: #f0faf4;
+                 margin: 0; padding: 0.5em 1em; }
+    a { color: #30ba78; }
+  `,
+
+  minimal: `
+    body { font-family: Georgia, "Times New Roman", serif; font-size: 12px;
+           line-height: 1.8; color: #111; max-width: 700px; margin: 0 auto; }
+    h1, h2, h3 { font-family: Helvetica, Arial, sans-serif; }
+    h1 { font-size: 1.8em; }
+    h2 { font-size: 1.3em; }
+    code, pre { font-family: "Courier New", monospace; background: #f9f9f9; }
+    code { padding: 0.1em 0.3em; border: 1px solid #ddd; border-radius: 2px; }
+    pre  { padding: 12px; border: 1px solid #ddd; }
+    pre code { border: none; background: none; }
+    pre.mermaid { background: transparent; border: none; }
+    blockquote { border-left: 3px solid #ccc; margin: 0; padding: 0 1em; color: #555; }
+    table { border-collapse: collapse; }
+    th, td { border: 1px solid #ccc; padding: 5px 10px; }
+  `,
+
+  consulting: `
+    body { font-family: "Helvetica Neue", Arial, sans-serif; font-size: 12px;
+           line-height: 1.6; color: #2c2c2c; max-width: 820px; margin: 0 auto; }
+    h1 { font-size: 1.9em; color: #1a1a2e; border-bottom: 3px solid #1a1a2e;
+         padding-bottom: 0.4em; text-transform: uppercase; letter-spacing: 0.05em; }
+    h2 { font-size: 1.3em; color: #1a1a2e; border-left: 4px solid #e94560;
+         padding-left: 0.6em; margin-top: 1.8em; }
+    h3 { font-size: 1.05em; color: #333; text-transform: uppercase;
+         letter-spacing: 0.04em; font-size: 0.9em; }
+    code { background: #f4f4f4; padding: 0.2em 0.4em; border-radius: 2px;
+           font-family: "Courier New", monospace; font-size: 88%; color: #c7254e; }
+    pre  { background: #f4f4f4; border-left: 4px solid #e94560; padding: 14px; }
+    pre code { background: none; color: inherit; }
+    pre.mermaid { background: transparent; border: none; padding: 8px 0; }
+    table { border-collapse: collapse; width: 100%; font-size: 11px; }
+    th { background: #1a1a2e; color: white; padding: 7px 10px; text-align: left; }
+    td { border: 1px solid #ddd; padding: 5px 10px; }
+    tr:nth-child(even) { background: #f9f9f9; }
+    blockquote { border-left: 4px solid #e94560; color: #555; margin: 0; padding: 0 1em; }
+    a { color: #e94560; }
+  `,
+};
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function log(msg)  { process.stderr.write(`\x1b[32m[md2pdf]\x1b[0m ${msg}\n`); }
+function die(msg)  { process.stderr.write(`\x1b[31m[md2pdf] ERROR:\x1b[0m ${msg}\n`); process.exit(1); }
+
+function ensureLib() {
+  const marker = path.join(LIB_DIR, "node_modules", "md-to-pdf", "dist", "index.js");
+  if (!fs.existsSync(marker)) {
+    log(`First run — installing ${PKG} into ${LIB_DIR} (~150 MB including Chromium)...`);
+    fs.mkdirSync(LIB_DIR, { recursive: true });
+    if (!fs.existsSync(path.join(LIB_DIR, "package.json"))) {
+      fs.writeFileSync(path.join(LIB_DIR, "package.json"),
+        JSON.stringify({ name: "md2pdf-deps", private: true }));
+    }
+    const result = spawnSync("npm", ["install", PKG], {
+      cwd: LIB_DIR, stdio: "inherit",
+      env: { ...process.env, PUPPETEER_DOWNLOAD_PATH: path.join(LIB_DIR, ".cache") },
+    });
+    if (result.status !== 0) die("npm install failed. Check your network and Node.js setup.");
+    log("Installation complete.");
+  }
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+const args = process.argv.slice(2);
+
+if (args.includes("--list-themes")) {
+  console.log("Available themes:\n" + Object.keys(THEMES).map(t => `  ${t}`).join("\n"));
+  process.exit(0);
+}
+
+if (args.length === 0 || args.includes("--help") || args.includes("-h")) {
+  console.log(`
+md2pdf — Markdown to PDF (KaTeX math + Mermaid diagrams, no LaTeX)
+
+Usage:
+  md2pdf input.md                     → input.pdf (same directory)
+  md2pdf input.md output.pdf          → explicit output path
+  md2pdf input.md --theme suse        → SUSE brand theme
+  md2pdf input.md --css custom.css    → extra CSS on top of theme
+  md2pdf input.md --margins 20mm      → all margins (default: 15mm)
+  md2pdf input.md --paper A4          → page format (default: A4)
+  md2pdf input.md --landscape         → landscape orientation
+  md2pdf input.md --no-math           → skip KaTeX (faster, fully offline)
+  md2pdf input.md --no-diagrams       → skip Mermaid (faster, fully offline)
+  md2pdf input.md --no-open          → don't open PDF after generation
+  md2pdf --list-themes                → list available themes
+
+Built-in themes: ${Object.keys(THEMES).join(", ")}
+
+Note: KaTeX and Mermaid require network access (jsDelivr CDN).
+      Use --no-math / --no-diagrams when working offline.
+`);
+  process.exit(0);
+}
+
+let inputFile   = null;
+let outputFile  = null;
+let theme       = "default";
+let cssFile     = null;
+let margins     = "15mm";
+let paper       = "A4";
+let landscape   = false;
+let noMath      = false;
+let noDiagrams  = false;
+let noOpen      = false;
+
+for (let i = 0; i < args.length; i++) {
+  const a = args[i];
+  if      (a === "--theme")       { theme      = args[++i]; }
+  else if (a === "--css")         { cssFile    = args[++i]; }
+  else if (a === "--margins")     { margins    = args[++i]; }
+  else if (a === "--paper")       { paper      = args[++i]; }
+  else if (a === "--landscape")   { landscape  = true; }
+  else if (a === "--no-math")     { noMath     = true; }
+  else if (a === "--no-diagrams") { noDiagrams = true; }
+  else if (a === "--no-open")     { noOpen     = true; }
+  else if (!a.startsWith("--")) {
+    if (!inputFile)      inputFile  = a;
+    else if (!outputFile) outputFile = a;
+  }
+}
+
+if (!inputFile) die("No input file specified.");
+if (!fs.existsSync(inputFile)) die(`File not found: ${inputFile}`);
+if (!THEMES[theme]) die(`Unknown theme "${theme}". Run md2pdf --list-themes.`);
+
+if (!outputFile) {
+  const p = path.parse(path.resolve(inputFile));
+  outputFile = path.join(p.dir, p.name + ".pdf");
+}
+
+// ── Run ───────────────────────────────────────────────────────────────────────
+ensureLib();
+
+const { mdToPdf } = require(path.join(LIB_DIR, "node_modules", "md-to-pdf"));
+
+let css = THEMES[theme];
+if (cssFile) {
+  if (!fs.existsSync(cssFile)) die(`CSS file not found: ${cssFile}`);
+  css += "\n" + fs.readFileSync(cssFile, "utf8");
+}
+
+// Build script / stylesheet lists — KaTeX first, then Mermaid
+// (order matters: scripts are injected sequentially by Puppeteer)
+const stylesheets = [
+  ...(!noMath     ? [KATEX_STYLESHEET] : []),
+];
+const scripts = [
+  ...(!noMath     ? KATEX_SCRIPTS     : []),
+  ...(!noDiagrams ? MERMAID_SCRIPTS   : []),
+];
+const markedExtensions = [
+  ...(!noDiagrams ? [MERMAID_MARKED_EXTENSION] : []),
+];
+
+const features = [
+  !noMath     && "KaTeX",
+  !noDiagrams && "Mermaid",
+].filter(Boolean).join(" + ") || "plain";
+
+(async () => {
+  try {
+    log(`Converting ${path.basename(inputFile)} → ${path.basename(outputFile)} [theme: ${theme}, ${features}]`);
+
+    const pdf = await mdToPdf(
+      { path: path.resolve(inputFile) },
+      {
+        css,
+        stylesheet:        stylesheets,
+        script:            scripts,
+        marked_extensions: markedExtensions,
+        pdf_options: {
+          format: paper,
+          landscape,
+          margin: { top: margins, right: margins, bottom: margins, left: margins },
+          printBackground: true,
+        },
+        launch_options: {
+          args: ["--no-sandbox", "--disable-setuid-sandbox"],
+        },
+        // networkidle0: wait for all CDN fetches (KaTeX fonts, Mermaid SVG render)
+        // to complete before Puppeteer triggers the print step.
+        wait_until: (noMath && noDiagrams) ? "load" : "networkidle0",
+      }
+    );
+
+    if (!pdf) die("Conversion produced no output.");
+    const absOutput = path.resolve(outputFile);
+    fs.writeFileSync(absOutput, pdf.content);
+    log(`Done → ${absOutput}`);
+
+    if (!noOpen) {
+      // Use the platform's native open command — no extra deps needed.
+      const opener = process.platform === "win32" ? "start"
+                   : process.platform === "darwin" ? "open"
+                   : "xdg-open";          // Linux / WSL
+      const r = spawnSync(opener, [absOutput], { stdio: "ignore", shell: process.platform === "win32" });
+      if (r.error) warn(`Could not open PDF: ${r.error.message} (use --no-open to suppress)`);
+    }
+  } catch (err) {
+    die(err.message || String(err));
+  }
+})();
