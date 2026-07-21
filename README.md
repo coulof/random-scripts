@@ -5,7 +5,7 @@ A collection of utility scripts for Git automation, Homebrew setup, and SUSE/Har
 ## Scripts
 
 *   **[get-harvester-kernel.sh](./get-harvester-kernel.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
-*   **[git-all](./git-all)**: Runs specified Git operations (`pull` or `gc`) on all Git repositories found recursively under a directory.
+*   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
 *   **[git-gc-all](./git-gc-all)**: Performs garbage collection across multiple repositories.
 *   **[md2pdf](./md2pdf)**: Converts Markdown documents to beautifully styled PDFs with KaTeX math, Mermaid diagrams, and custom themes.
@@ -55,14 +55,20 @@ The `git-all` script runs specified Git operations on all Git repositories found
 # Pull operations
 git-all pull                   # pull every repo in the directory & sub-directories
 git-all pull ~/SUSE            # pull every repo, fast-forward only
-git-all pull -n ~/SUSE         # dry-run
 git-all pull -s ~/SUSE         # skip repos with uncommitted changes
 
 # Garbage collection operations
 git-all gc                     # gc every repo in the current directory and its subdir
 git-all gc ~/SUSE              # gc every repo
 git-all gc -a ~/SUSE           # aggressive gc
-git-all gc -n ~/SUSE           # dry-run
+
+# Status operations
+git-all status                 # check status of every repo in the directory & sub-directories
+git-all status ~/SUSE          # check status of every repo (concise short status)
+
+# List operations
+git-all list                   # list every repo found recursively
+git-all list ~/SUSE            # list every repo found under ~/SUSE
 ```
 
 ## Usage: `md2pdf`
