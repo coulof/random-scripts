@@ -4,24 +4,31 @@ A collection of utility scripts for Git automation, Homebrew setup, and SUSE/Har
 
 ## Scripts
 
-*   **[get-harvester-kernel.sh](./get-harvester-kernel.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
+*   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
 *   **[git-gc-all](./git-gc-all)**: Performs garbage collection across multiple repositories.
 *   **[md2pdf](./md2pdf)**: Converts Markdown documents to beautifully styled PDFs with KaTeX math, Mermaid diagrams, and custom themes.
+*   **[check_obsidian_links.py](./check_obsidian_links.py)**: Scans an Obsidian vault recursively to detect and list broken internal links.
+*   **[audit_mixed_brackets.py](./audit_mixed_brackets.py)**: Audits an Obsidian vault to find mixed-bracket markdown link typos of the form `[[text](url)]`.
+*   **[inspect-sbom.py](./inspect-sbom.py)**: Auto-detects, parses, and queries packages, versions, and licenses from SPDX 2.0 and CycloneDX JSON SBOMs.
 
-## Usage: `get-harvester-kernel.sh`
+## Usage: `inspect-harvester-release.sh`
 
-Extracts the kernel version or the list of installed RPM packages from a Harvester release squashfs image without needing to deploy an active node. Downloads the squashfs rootfs, extracts `/lib/modules` (for kernel version) or `/usr/lib/sysimage/rpm` (for package list), and reads the information.
+Extracts the kernel version, the list of installed RPM packages, or the bundle container images from a Harvester release without needing to deploy an active node. Downloads the squashfs rootfs and extracts the information, or uses a high-performance fast-path directly querying the lightweight image list from GitHub.
 
 ```bash
-Usage: ./get-harvester-kernel.sh [options] <version[,version...]>
+Usage: ./inspect-harvester-release.sh [options] [version[,version...]]
 
 Options:
   -a, --arch <arch>      Architecture: amd64 (default) | arm64
   -k, --keep             Keep the downloaded and extracted squashfs files
   -q, --quiet            Quiet mode: suppress progress messages and logs
   -p, --packages         List all installed RPM packages instead of kernel version
+  -i, --images           List bundle container images instead of kernel version
+  -f, --filter <pattern> Filter packages or images by a case-insensitive pattern
+  --force-squashfs       Force image list extraction from squashfs (skip GitHub fast path)
+  -s, --squashfs <file>  Read from a local squashfs file instead of downloading
   -h, --help             Show this help message
 ```
 
@@ -29,22 +36,40 @@ Options:
 
 ```bash
 # Extract kernel version from Harvester v1.7.0 (defaults to amd64)
-./get-harvester-kernel.sh v1.7.0
+./inspect-harvester-release.sh v1.7.0
 
 # Extract kernel version from Harvester v1.2.2 for arm64 architecture
-./get-harvester-kernel.sh v1.2.2 arm64
+./inspect-harvester-release.sh v1.2.2 arm64
 
 # Suppress log and progress output to retrieve only the raw kernel version
-./get-harvester-kernel.sh -q v1.3.1
+./inspect-harvester-release.sh -q v1.8.1
 
 # Query multiple versions and print their kernel versions
-./get-harvester-kernel.sh -q v1.3.1,v1.3.0
+./inspect-harvester-release.sh -q v1.8.1,v1.8.0
 
 # Extract from multiple versions and keep the downloaded assets
-./get-harvester-kernel.sh -k v1.7.0,v1.8.0
+./inspect-harvester-release.sh -k v1.7.0,v1.8.0
 
-# List all packages installed in Harvester v1.3.1 (using local rpm or Docker)
-./get-harvester-kernel.sh -p v1.3.1
+# List all packages installed in Harvester v1.8.1 (using local rpm or Docker)
+./inspect-harvester-release.sh -p v1.8.1
+
+# List all container images bundled in Harvester v1.8.1
+./inspect-harvester-release.sh -i v1.8.1
+
+# List Longhorn container images and tags used in Harvester v1.8.1
+./inspect-harvester-release.sh -i -f longhorn v1.8.1
+
+# Force the extraction of the container image list from squashfs rootfs for v1.8.1
+./inspect-harvester-release.sh -i --force-squashfs v1.8.1
+
+# Extract the kernel version from a local squashfs file
+./inspect-harvester-release.sh -s /path/to/rootfs.squashfs
+
+# List all RPM packages from a local squashfs file
+./inspect-harvester-release.sh -s /path/to/rootfs.squashfs -p
+
+# List bundle container images from a local squashfs file (requires ISO squashfs)
+./inspect-harvester-release.sh -s /path/to/iso-rootfs.squashfs -i
 ```
 
 ## Usage: `git-all`
@@ -120,6 +145,61 @@ md2pdf input.md --theme suse
 
 # Convert with custom margins and landscape orientation
 md2pdf input.md --margins 20mm --landscape
+```
+
+## Usage: `check_obsidian_links.py`
+
+Recursively scans an Obsidian vault, parses frontmatter aliases, and checks that every internal link (`[[target]]` or `[[target|display]]`) resolves to an actual note, media file, or alias within the vault. Reports broken links with source file paths and line numbers.
+
+```bash
+# Scan a specific Obsidian vault path
+./check_obsidian_links.py /path/to/your/vault
+
+# If no path is specified, it defaults to "~/SUSE/Obsidian/Vault" or the current working directory
+./check_obsidian_links.py
+```
+
+## Usage: `audit_mixed_brackets.py`
+
+Recursively audits Markdown files for mixed-bracket link typos of the form `[[text](url)]` (unintended combinations of internal wiki-link double brackets and external Markdown link parenthesis).
+
+```bash
+# Audit a specific Obsidian vault path
+./audit_mixed_brackets.py /path/to/your/vault
+
+# If no path is specified, it defaults to "~/SUSE/Obsidian/Vault" or the current working directory
+./audit_mixed_brackets.py
+```
+
+## Usage: `inspect-sbom.py`
+
+Inspects and queries software package lists, versions, and declared licenses from standard Software Bill of Materials (SBOM) documents. Features automatic format detection for both SPDX 2.0 and CycloneDX JSON formats.
+
+```bash
+Usage: ./inspect-sbom.py [options] <sbom-file.json>
+
+Options:
+  -p, --packages         List all package names and versions (default)
+  -l, --licenses         List packages alongside their licenses
+  -f, --filter <pattern> Filter packages, versions, or licenses by a case-insensitive regex
+  -s, --summary          Print high-level summary statistics of the SBOM contents
+  -h, --help             Show this help message
+```
+
+### Examples
+
+```bash
+# List all packages in an SPDX SBOM
+./inspect-sbom.py SL-Micro-Extras-6.2-x86_64-GM.spdx.json
+
+# List all packages and versions in a CycloneDX SBOM
+./inspect-sbom.py SL-Micro-Extras-6.2-x86_64-GM.cdx.json
+
+# Print high-level stats and top 10 most common licenses
+./inspect-sbom.py -s SL-Micro-Extras-6.2-x86_64-GM.spdx.json
+
+# Find all packages containing "kernel" or "linux" and list their licenses
+./inspect-sbom.py -l -f "kernel|linux" SL-Micro-Extras-6.2-x86_64-GM.cdx.json
 ```
 
 ## Prerequisites
