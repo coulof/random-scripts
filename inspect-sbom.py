@@ -136,6 +136,11 @@ def main():
             if pattern.search(p["name"]) or pattern.search(p["version"]) or pattern.search(p["license"])
         ]
 
+    # Handle empty packages
+    if not packages and not args.summary:
+        print("No results found.")
+        return
+
     # Handle requested actions
     if args.summary:
         print_summary(format_name, packages, args.sbom_file)
