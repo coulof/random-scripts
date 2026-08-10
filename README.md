@@ -1,8 +1,34 @@
 # Random Scripts 🛠️
 
-A collection of utility scripts for Git automation, Homebrew setup, and SUSE/Harvester kernel extraction.
+A collection of utility scripts for Git automation, Homebrew setup, Kubernetes workloads, and SUSE/Harvester kernel extraction.
+
+## Kubernetes Test Workloads 🧪
+
+Quick single-line commands to deploy lightweight test workloads to Kubernetes clusters:
+
+### Stateless Workload (`whoami`)
+Deploy 3 replicas of Traefik `whoami` behind a `LoadBalancer` service:
+```bash
+# Deploy
+kubectl apply -f whoami.yaml
+
+# Clean up
+kubectl delete -f whoami.yaml
+```
+
+### Stateful Workload (`kbench` FIO)
+Run FIO storage benchmarks via Longhorn `kbench`:
+```bash
+# Deploy / Run benchmark
+kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/fio.yaml
+
+# Clean up
+kubectl delete -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/fio.yaml
+```
 
 ## Scripts
+
+*   **[whoami.yaml](./whoami.yaml)**: Stateless Kubernetes test workload with 3 `traefik/whoami` replicas behind a `LoadBalancer` service.
 
 *   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
