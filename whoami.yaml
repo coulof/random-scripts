@@ -46,6 +46,9 @@ metadata:
   name: whoami
   labels:
     app.kubernetes.io/name: whoami
+  annotations:
+    cloudprovider.harvesterhci.io/ipam: pool
+    cloudprovider.harvesterhci.io/ip-pool: prod-ip-pool-vlan178
 spec:
   type: LoadBalancer
   ports:
