@@ -10,10 +10,7 @@ Quick single-line commands to deploy lightweight test workloads to Kubernetes cl
 Deploy 3 replicas of Traefik `whoami` behind a `LoadBalancer` service:
 ```bash
 # Deploy
-kubectl apply -f whoami.yaml
-
-# Clean up
-kubectl delete -f whoami.yaml
+kubectl apply -f https://raw.githubusercontent.com/coulof/random-scripts/refs/heads/main/whoami.yaml
 ```
 
 ### Stateful Workload (`kbench` FIO)
@@ -21,15 +18,11 @@ Run FIO storage benchmarks via Longhorn `kbench`:
 ```bash
 # Deploy / Run benchmark
 kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/fio.yaml
-
-# Clean up
-kubectl delete -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/fio.yaml
 ```
 
 ## Scripts
 
 *   **[whoami.yaml](./whoami.yaml)**: Stateless Kubernetes test workload with 3 `traefik/whoami` replicas behind a `LoadBalancer` service.
-
 *   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
