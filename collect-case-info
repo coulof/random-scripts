@@ -1,0 +1,807 @@
+#!/usr/bin/env python3
+"""
+collect-case-info - Support Case Information Collector
+Gathers environment details (probing via kubectl or Lima VMs) and ticket descriptions
+to format structured, submission-ready support cases for Rancher, Longhorn, and Kubernetes.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+
+def get_system_timezone():
+    """Detect the local timezone with UTC offset."""
+    now = datetime.datetime.now().astimezone()
+    tz_name = now.tzname() or "UTC"
+    offset = now.strftime("%z")
+    if offset:
+        offset_formatted = f"UTC{offset[:3]}:{offset[3:]}"
+    else:
+        offset_formatted = "UTC"
+    return f"{tz_name} ({offset_formatted})"
+
+
+def copy_to_clipboard(text):
+    """Copy text to clipboard across macOS, Linux (X11/Wayland), and Windows."""
+    commands = [
+        ["pbcopy"],
+        ["wl-copy"],
+        ["xclip", "-selection", "clipboard"],
+        ["xsel", "--clipboard", "--input"],
+        ["clip.exe"],
+    ]
+    for cmd in commands:
+        if shutil.which(cmd[0]):
+            try:
+                proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                proc.communicate(text.encode("utf-8"))
+                if proc.returncode == 0:
+                    return True, cmd[0]
+            except Exception:
+                pass
+    return False, None
+
+
+def get_running_lima_vms():
+    """List names of currently running Lima instances if limactl is available."""
+    if not shutil.which("limactl"):
+        return []
+    try:
+        res = subprocess.run(
+            ["limactl", "list", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        if res.returncode == 0:
+            vms = []
+            for line in res.stdout.strip().splitlines():
+                if line.strip():
+                    try:
+                        vm_data = json.loads(line)
+                        if vm_data.get("status") == "Running":
+                            vms.append(vm_data.get("name"))
+                    except Exception:
+                        pass
+            return vms
+    except Exception:
+        pass
+    return []
+
+
+def run_cmd(cmd, timeout=25, verbose=False):
+    """Run a shell command and return (stdout, stderr, returncode)."""
+    if verbose:
+        print(f"[DEBUG] Running: {cmd}", file=sys.stderr)
+    try:
+        res = subprocess.run(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        if verbose and res.returncode != 0 and res.stderr:
+            print(f"[DEBUG] stderr: {res.stderr.strip()}", file=sys.stderr)
+        return res.stdout.strip(), res.stderr.strip(), res.returncode
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print(f"[DEBUG] Command timed out after {timeout}s: {cmd}", file=sys.stderr)
+        return None, f"Command timed out after {timeout} seconds", -1
+    except Exception as e:
+        if verbose:
+            print(f"[DEBUG] Command exception: {e}", file=sys.stderr)
+        return None, str(e), -1
+
+
+def build_k8s_prefix(kubeconfig=None, context=None, insecure=False, lima=None):
+    """Construct the base kubectl command with flags and optional Lima wrapper."""
+    parts = []
+    if lima:
+        parts.extend(["limactl", "shell", lima, "kubectl"])
+    else:
+        parts.append("kubectl")
+
+    if kubeconfig:
+        expanded_kc = os.path.abspath(os.path.expanduser(kubeconfig))
+        parts.extend(["--kubeconfig", shlex.quote(expanded_kc)])
+
+    if context:
+        parts.extend(["--context", shlex.quote(context)])
+
+    if insecure:
+        parts.append("--insecure-skip-tls-verify=true")
+
+    return " ".join(parts)
+
+
+def probe_kubectl_cluster(kubeconfig=None, context=None, insecure=False, lima=None, timeout=25, verbose=False):
+    """
+    Probes the active kubectl context (or Lima instance) for cluster information:
+    Rancher version, Downstream cluster info, Kubernetes version, CNI, Longhorn,
+    node specs (OS, CPU, memory), and 3rd-party node daemonsets.
+    """
+    # Verify binary availability
+    if lima:
+        if not shutil.which("limactl"):
+            return {"available": False, "reason": "limactl binary not found in PATH on host"}
+    else:
+        if not shutil.which("kubectl"):
+            return {"available": False, "reason": "kubectl binary not found in PATH"}
+
+    base_k8s = build_k8s_prefix(kubeconfig=kubeconfig, context=context, insecure=insecure, lima=lima)
+
+    # 1. Check current context
+    ctx_out, ctx_err, ctx_code = run_cmd(f"{base_k8s} config current-context", timeout=timeout, verbose=verbose)
+    active_context = ctx_out if ctx_code == 0 and ctx_out else (context or (f"Lima:{lima}" if lima else "default"))
+
+    # 2. Test connectivity with node list
+    nodes_raw, nodes_err, nodes_code = run_cmd(f"{base_k8s} get nodes -o json", timeout=timeout, verbose=verbose)
+    if nodes_code != 0 or not nodes_raw:
+        reason = nodes_err.splitlines()[-1] if nodes_err else "Failed to connect to Kubernetes API server"
+        
+        # Check if running Lima VMs exist to provide a helpful hint
+        running_vms = get_running_lima_vms() if not lima else []
+        hint = ""
+        if running_vms and not lima:
+            hint = f" (Hint: You have running Lima VM(s): {', '.join(running_vms)}. Try passing '--lima {running_vms[0]}')"
+
+        return {
+            "available": False,
+            "reason": f"{reason}{hint}",
+            "raw_error": nodes_err,
+        }
+
+    try:
+        nodes_data = json.loads(nodes_raw)
+    except Exception as e:
+        return {"available": False, "reason": f"Failed to parse node JSON: {e}"}
+
+    items = nodes_data.get("items", [])
+    node_count = len(items)
+
+    node_os_set = set()
+    kernel_set = set()
+    kubelet_versions = set()
+    cpus = []
+    memories_bytes = []
+    instance_types = set()
+    providers = set()
+
+    for item in items:
+        status = item.get("status", {})
+        node_info = status.get("nodeInfo", {})
+        os_image = node_info.get("osImage", "")
+        if os_image:
+            node_os_set.add(os_image)
+        kernel_ver = node_info.get("kernelVersion", "")
+        if kernel_ver:
+            kernel_set.add(kernel_ver)
+        kubelet_ver = node_info.get("kubeletVersion", "")
+        if kubelet_ver:
+            kubelet_versions.add(kubelet_ver)
+
+        # Capacity calculation
+        capacity = status.get("capacity", {})
+        cpu_str = capacity.get("cpu", "")
+        if cpu_str:
+            try:
+                cpus.append(int(cpu_str))
+            except ValueError:
+                pass
+
+        mem_str = capacity.get("memory", "")
+        if mem_str:
+            if mem_str.endswith("Ki"):
+                memories_bytes.append(int(mem_str[:-2]) * 1024)
+            elif mem_str.endswith("Mi"):
+                memories_bytes.append(int(mem_str[:-2]) * 1024 * 1024)
+            elif mem_str.endswith("Gi"):
+                memories_bytes.append(int(mem_str[:-2]) * 1024 * 1024 * 1024)
+            elif mem_str.isdigit():
+                memories_bytes.append(int(mem_str))
+
+        # Labels for infra detection
+        labels = item.get("metadata", {}).get("labels", {})
+        inst = (
+            labels.get("node.kubernetes.io/instance-type")
+            or labels.get("beta.kubernetes.io/instance-type")
+        )
+        if inst:
+            instance_types.add(inst)
+
+        provider_id = item.get("spec", {}).get("providerID", "")
+        if "aws://" in provider_id:
+            providers.add("AWS (EC2/EKS)")
+        elif "gce://" in provider_id:
+            providers.add("GCE / GKE")
+        elif "azure://" in provider_id:
+            providers.add("Azure / AKS")
+        elif "vsphere://" in provider_id:
+            providers.add("VMWare vSphere")
+        elif "harvester://" in provider_id:
+            providers.add("Harvester HCI")
+
+    # Format Node OS
+    node_os_str = ", ".join(sorted(list(node_os_set))) if node_os_set else ""
+    if kernel_set and len(kernel_set) == 1:
+        node_os_str += f" (Kernel {list(kernel_set)[0]})"
+    elif len(kernel_set) > 1:
+        node_os_str += f" (Kernels: {', '.join(sorted(list(kernel_set)))})"
+
+    # CPU and Memory
+    avg_cpu = f"{cpus[0]} vCPU" if cpus and len(set(cpus)) == 1 else (f"avg {sum(cpus)//len(cpus)} vCPU" if cpus else "")
+    if memories_bytes:
+        avg_mem_gib = sum(memories_bytes) / len(memories_bytes) / (1024 ** 3)
+        avg_mem = f"{round(avg_mem_gib)} GiB"
+    else:
+        avg_mem = ""
+
+    # Kubelet & Distribution detection
+    kubelet_str = ", ".join(sorted(list(kubelet_versions))) if kubelet_versions else ""
+    distro_str = kubelet_str
+
+    # Server version
+    k8s_version = ""
+    ver_raw, _, ver_code = run_cmd(f"{base_k8s} version -o json", timeout=timeout, verbose=verbose)
+    if ver_code == 0 and ver_raw:
+        try:
+            ver_json = json.loads(ver_raw)
+            k8s_version = ver_json.get("serverVersion", {}).get("gitVersion", "")
+        except Exception:
+            pass
+    if not k8s_version and kubelet_str:
+        k8s_version = kubelet_str.split("+")[0]
+
+    # CNI Detection
+    cni_detected = []
+    ds_raw, _, ds_code = run_cmd(f"{base_k8s} get daemonsets -A -o json", timeout=timeout, verbose=verbose)
+    daemonset_names = []
+    if ds_code == 0 and ds_raw:
+        try:
+            ds_json = json.loads(ds_raw)
+            for d in ds_json.get("items", []):
+                meta = d.get("metadata", {})
+                ns = meta.get("namespace", "")
+                name = meta.get("name", "")
+                daemonset_names.append((ns, name))
+        except Exception:
+            pass
+
+    for ns, name in daemonset_names:
+        lower_name = name.lower()
+        if "cilium" in lower_name or ns == "cilium":
+            cni_detected.append("Cilium")
+        elif "calico" in lower_name or ns in ("calico-system", "tigera-operator"):
+            cni_detected.append("Calico")
+        elif "canal" in lower_name:
+            cni_detected.append("Canal")
+        elif "flannel" in lower_name or "rke2-flannel" in lower_name:
+            cni_detected.append("Flannel")
+        elif "aws-node" in lower_name:
+            cni_detected.append("AWS VPC CNI")
+        elif "azure-cni" in lower_name or "azure-vnet" in lower_name:
+            cni_detected.append("Azure CNI")
+        elif "kube-ovn" in lower_name:
+            cni_detected.append("Kube-OVN")
+
+    cni_str = ", ".join(sorted(list(set(cni_detected)))) if cni_detected else ""
+
+    # Longhorn Detection
+    longhorn_ver = ""
+    lh_ds, _, _ = run_cmd(f"{base_k8s} get daemonset -n longhorn-system longhorn-manager -o jsonpath='{{.spec.template.spec.containers[0].image}}'", timeout=timeout, verbose=verbose)
+    if lh_ds and ":" in lh_ds:
+        longhorn_ver = lh_ds.split(":")[-1]
+    elif not lh_ds:
+        lh_pods, _, _ = run_cmd(f"{base_k8s} get pods -n longhorn-system -l app=longhorn-manager -o jsonpath='{{.items[0].spec.containers[0].image}}'", timeout=timeout, verbose=verbose)
+        if lh_pods and ":" in lh_pods:
+            longhorn_ver = lh_pods.split(":")[-1]
+
+    # Rancher Server Detection
+    rancher_ver = ""
+    is_rancher_cluster = False
+    downstream_count = ""
+    rancher_deploy, _, _ = run_cmd(f"{base_k8s} get deployment -n cattle-system rancher -o jsonpath='{{.spec.template.spec.containers[0].image}}'", timeout=timeout, verbose=verbose)
+    if rancher_deploy and ":" in rancher_deploy:
+        rancher_ver = rancher_deploy.split(":")[-1]
+        is_rancher_cluster = True
+    else:
+        r_setting, _, _ = run_cmd(f"{base_k8s} get setting.management.cattle.io server-version -o jsonpath='{{.value}}'", timeout=timeout, verbose=verbose)
+        if r_setting:
+            rancher_ver = r_setting
+            is_rancher_cluster = True
+
+    # Check downstream clusters managed by Rancher if this is Rancher management cluster
+    if is_rancher_cluster:
+        clusters_raw, _, _ = run_cmd(f"{base_k8s} get clusters.management.cattle.io -o jsonpath='{{.items[*].metadata.name}}'", timeout=timeout, verbose=verbose)
+        if clusters_raw:
+            cluster_list = clusters_raw.split()
+            downstream_list = [c for c in cluster_list if c != "local"]
+            downstream_count = str(len(downstream_list))
+    else:
+        # Check if this cluster is a downstream cluster managed by Rancher (has cattle-cluster-agent)
+        cattle_agent, _, _ = run_cmd(f"{base_k8s} get deployment -n cattle-system cattle-cluster-agent -o jsonpath='{{.spec.template.spec.containers[0].image}}'", timeout=timeout, verbose=verbose)
+        if cattle_agent and ":" in cattle_agent:
+            rancher_ver = cattle_agent.split(":")[-1]
+            downstream_count = "0"
+
+    # 3rd-party Software detection (Security/Monitoring agents)
+    third_party = set()
+    for ns, name in daemonset_names:
+        lname = name.lower()
+        if "falcon" in lname or "crowdstrike" in lname:
+            third_party.add("CrowdStrike Falcon Sensor")
+        elif "datadog" in lname:
+            third_party.add("Datadog Agent")
+        elif "twistlock" in lname or "prisma" in lname:
+            third_party.add("Prisma Cloud (Twistlock)")
+        elif "dynatrace" in lname or "oneagent" in lname:
+            third_party.add("Dynatrace OneAgent")
+        elif "splunk" in lname:
+            third_party.add("Splunk Universal Forwarder")
+        elif "wiz" in lname:
+            third_party.add("Wiz Sensor")
+        elif "qualys" in lname:
+            third_party.add("Qualys Cloud Agent")
+        elif "neuvector" in lname:
+            third_party.add("NeuVector Enforcer")
+        elif "sysdig" in lname:
+            third_party.add("Sysdig Agent")
+
+    third_party_str = ", ".join(sorted(list(third_party))) if third_party else "None"
+
+    # Underlying infrastructure hint
+    infra_str = ""
+    if providers:
+        infra_str = ", ".join(sorted(list(providers)))
+    elif instance_types:
+        infra_str = f"Cloud ({', '.join(sorted(list(instance_types)))})"
+
+    return {
+        "available": True,
+        "context": active_context,
+        "is_rancher_cluster": is_rancher_cluster,
+        "rancher_version": rancher_ver,
+        "node_count": str(node_count),
+        "node_os": node_os_str,
+        "distro_version": distro_str,
+        "kubernetes_version": k8s_version,
+        "cni": cni_str,
+        "longhorn_version": longhorn_ver,
+        "cpu_per_node": avg_cpu,
+        "memory_per_node": avg_mem,
+        "downstream_count": downstream_count,
+        "third_party": third_party_str,
+        "infrastructure": infra_str,
+    }
+
+
+def prompt_input(label, default="", choices=None, multi_line=False, use_editor=False):
+    """Prompt the user for a value with an optional default and editor fallback."""
+    if choices:
+        choice_str = f" [{'/'.join(choices)}]"
+    else:
+        choice_str = ""
+
+    default_hint = f" [{default}]" if default else ""
+
+    if multi_line:
+        print(f"\n--- {label} ---")
+        if use_editor:
+            print(f"Opening editor (${os.environ.get('EDITOR', 'vim')})... (Save and exit when done)")
+            return open_in_editor(default)
+
+        print("Enter multi-line text (Type 'EOF' or press Ctrl+D on a new line to finish, or press Enter for default):")
+        lines = []
+        try:
+            while True:
+                line = input()
+                if line.strip() == "EOF":
+                    break
+                lines.append(line)
+        except EOFError:
+            pass
+        content = "\n".join(lines).strip()
+        return content if content else default
+
+    prompt_str = f"{label}{choice_str}{default_hint}: "
+    try:
+        val = input(prompt_str).strip()
+        return val if val else default
+    except EOFError:
+        return default
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(1)
+
+
+def open_in_editor(initial_content=""):
+    """Open a temporary file in the user's preferred editor ($EDITOR or vim/nano)."""
+    editor = os.environ.get("EDITOR") or ("nano" if shutil.which("nano") else "vim")
+    with tempfile.NamedTemporaryFile(suffix=".md", mode="w+", delete=False) as tf:
+        tf.write(initial_content)
+        tf.flush()
+        temp_name = tf.name
+
+    try:
+        subprocess.run([editor, temp_name], check=True)
+        with open(temp_name, "r") as f:
+            content = f.read().strip()
+        return content
+    except Exception as e:
+        print(f"Warning: Editor failed ({e}), falling back to direct input.")
+        return initial_content
+    finally:
+        if os.path.exists(temp_name):
+            os.remove(temp_name)
+
+
+def generate_case_markdown(data):
+    """Render the standardized support case Markdown."""
+    rancher_cluster = data.get("rancher_cluster", {})
+    downstream = data.get("downstream_cluster", {})
+    longhorn = data.get("longhorn", {})
+    other = data.get("other", {})
+    ticket = data.get("ticket_description", {})
+
+    workaround_status = ticket.get("workaround_implemented", "no")
+    workaround_details = ticket.get("workaround_details", "<text>")
+
+    repro = ticket.get("repro_steps", "1. step 1\n2. step 2")
+    if isinstance(repro, list):
+        repro = "\n".join(f"{i+1}. {step}" for i, step in enumerate(repro))
+
+    md = f"""Rancher Cluster:
+Rancher version: {rancher_cluster.get('rancher_version', '<version>')}
+Number of nodes: {rancher_cluster.get('nodes_count', '<number>')}
+Node OS version: {rancher_cluster.get('node_os', '<os version>')}
+
+Downstream Cluster:
+Number of Downstream clusters: {downstream.get('downstream_count', '<number>')}
+Node OS: {downstream.get('node_os', '<os version>')}
+RKE/RKE2/K3S version: {downstream.get('distro_version', '<version>')}
+Kubernetes version: {downstream.get('kubernetes_version', '<version>')}
+CNI: {downstream.get('cni', '<cni>')}
+
+Longhorn:
+Longhorn version: {longhorn.get('longhorn_version', '<version>')}
+CPU per node: {longhorn.get('cpu_per_node', '<cpu>')}
+Memory per node: {longhorn.get('memory_per_node', '<memory>')}
+Disk type: {longhorn.get('disk_type', 'HDD/SSD/NVMe')}
+Network bandwidth between the nodes: {longhorn.get('network_bandwidth', '<bandwidth>')}
+
+Other:
+Underlying Infrastructure: {other.get('infrastructure', 'AWS/GCE, EKS/GKE, VMWare/KVM, Baremetal')}
+Any 3rd party software installed on the nodes: {other.get('third_party', 'None')}
+Customer’s main time zone: {other.get('timezone', '<timezone>')}
+
+
+The ticket Description is : 
+Issue description:
+{ticket.get('issue_description', '<text>')}
+
+Business impact:
+{ticket.get('business_impact', '<text>')}
+
+Troubleshooting steps:
+{ticket.get('troubleshooting_steps', '<text>')}
+
+Repro steps:
+
+{repro}
+
+Workaround:
+Is a workaround available and implemented? {workaround_status}
+What is the workaround:
+{workaround_details}
+
+Actual behavior:
+{ticket.get('actual_behavior', '<text>')}
+
+Expected behavior:
+{ticket.get('expected_behavior', '<text>')}
+
+Files, logs, traces:
+{ticket.get('files_logs_traces', '<text>')}
+
+Additional notes:
+{ticket.get('additional_notes', '<text>')}
+"""
+    return md
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Collect support case information and format structured tickets for Rancher / Longhorn / Kubernetes."
+    )
+    parser.add_argument("-a", "--auto", "--probe", action="store_true", help="Probe active kubectl cluster context for environment values")
+    parser.add_argument("-k", "--kubeconfig", help="Path to kubeconfig file (defaults to $KUBECONFIG or ~/.kube/config)")
+    parser.add_argument("--context", help="Specific Kubernetes context to use within the kubeconfig")
+    parser.add_argument("--lima", help="Run kubectl queries inside a specified Lima VM instance (e.g. vpn-vm)")
+    parser.add_argument("--insecure", action="store_true", help="Skip TLS certificate verification (--insecure-skip-tls-verify)")
+    parser.add_argument("--timeout", type=int, default=25, help="Timeout in seconds for cluster queries (default: 25)")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose debug logging for cluster queries")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Launch interactive wizard to enter or refine all details")
+    parser.add_argument("-t", "--template", action="store_true", help="Generate an empty skeleton template with placeholders")
+    parser.add_argument("-o", "--output", help="Save the generated ticket markdown to the specified file path")
+    parser.add_argument("-c", "--clipboard", action="store_true", help="Copy the generated ticket markdown to clipboard")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Quiet mode: suppress banners and progress messages (clean output)")
+    parser.add_argument("-e", "--editor", action="store_true", help="Use $EDITOR for multi-line ticket descriptions during interactive mode")
+    parser.add_argument("--json", action="store_true", help="Output case data as structured JSON instead of Markdown")
+    parser.add_argument("--pdf", action="store_true", help="Compile the generated ticket to PDF using md2pdf")
+    parser.add_argument("--theme", default="suse", help="Theme to pass to md2pdf when --pdf is used (default: suse)")
+    args = parser.parse_args()
+
+    show_banner = sys.stdout.isatty() and not args.quiet
+
+    # Kubeconfig resolution: CLI flag > env var
+    kubeconfig_path = args.kubeconfig or os.environ.get("KUBECONFIG")
+    lima_instance = args.lima or os.environ.get("LIMA_INSTANCE")
+
+    # Template mode
+    if args.template:
+        data = {
+            "rancher_cluster": {
+                "rancher_version": "<version>",
+                "nodes_count": "<number>",
+                "node_os": "<os version>",
+            },
+            "downstream_cluster": {
+                "downstream_count": "<number>",
+                "node_os": "<os version>",
+                "distro_version": "<version>",
+                "kubernetes_version": "<version>",
+                "cni": "<cni>",
+            },
+            "longhorn": {
+                "longhorn_version": "<version>",
+                "cpu_per_node": "<cpu>",
+                "memory_per_node": "<memory>",
+                "disk_type": "HDD/SSD/NVMe",
+                "network_bandwidth": "<bandwidth>",
+            },
+            "other": {
+                "infrastructure": "AWS/GCE, EKS/GKE, VMWare/KVM, Baremetal",
+                "third_party": "None",
+                "timezone": get_system_timezone(),
+            },
+            "ticket_description": {
+                "issue_description": "<text>",
+                "business_impact": "<text>",
+                "troubleshooting_steps": "<text>",
+                "repro_steps": "step 1\nstep 2",
+                "workaround_implemented": "no",
+                "workaround_details": "<text>",
+                "actual_behavior": "<text>",
+                "expected_behavior": "<text>",
+                "files_logs_traces": "<text>",
+                "additional_notes": "<text>",
+            },
+        }
+    else:
+        probe_res = {"available": False}
+        if args.auto or args.interactive or not sys.stdin.isatty():
+            probe_res = probe_kubectl_cluster(
+                kubeconfig=kubeconfig_path,
+                context=args.context,
+                insecure=args.insecure,
+                lima=lima_instance,
+                timeout=args.timeout,
+                verbose=args.verbose,
+            )
+
+        if probe_res.get("available") and show_banner:
+            print(f"✓ Successfully probed cluster context: {probe_res.get('context')}")
+        elif args.auto and not args.quiet:
+            print(f"! Notice: Could not auto-probe cluster ({probe_res.get('reason')})", file=sys.stderr)
+
+        # Initial values from probe or defaults
+        default_tz = get_system_timezone()
+        
+        # Decide if we are doing interactive mode
+        is_interactive = args.interactive or (sys.stdin.isatty() and not args.auto and not args.template and not args.quiet)
+
+        if is_interactive:
+            print("\n" + "=" * 60)
+            print("         Support Case Information Collector Wizard")
+            print("=" * 60)
+            if probe_res.get("available"):
+                print(f"Values probed from cluster [{probe_res.get('context')}] are shown in brackets []. Press Enter to accept.")
+            print("=" * 60 + "\n")
+
+            print("[1/5] --- Rancher Cluster ---")
+            r_ver = prompt_input("Rancher version", probe_res.get("rancher_version", "v2.8.5"))
+            r_nodes = prompt_input("Number of nodes", probe_res.get("node_count", "3"))
+            r_node_os = prompt_input("Node OS version", probe_res.get("node_os", "SLES 15 SP5"))
+
+            print("\n[2/5] --- Downstream Cluster ---")
+            d_count = prompt_input("Number of Downstream clusters", probe_res.get("downstream_count", "1"))
+            d_node_os = prompt_input("Downstream Node OS", probe_res.get("node_os", r_node_os))
+            d_distro = prompt_input("RKE/RKE2/K3S version", probe_res.get("distro_version", "v1.28.10+rke2r1"))
+            d_k8s = prompt_input("Kubernetes version", probe_res.get("kubernetes_version", "v1.28.10"))
+            d_cni = prompt_input("CNI", probe_res.get("cni", "Canal"))
+
+            print("\n[3/5] --- Longhorn ---")
+            lh_ver = prompt_input("Longhorn version", probe_res.get("longhorn_version", "v1.6.2"))
+            lh_cpu = prompt_input("CPU per node", probe_res.get("cpu_per_node", "16 vCPU"))
+            lh_mem = prompt_input("Memory per node", probe_res.get("memory_per_node", "64 GiB"))
+            lh_disk = prompt_input("Disk type (HDD/SSD/NVMe)", "NVMe")
+            lh_net = prompt_input("Network bandwidth between the nodes", "10 Gbps")
+
+            print("\n[4/5] --- Other Infrastructure ---")
+            infra = prompt_input("Underlying Infrastructure (AWS/GCE, EKS/GKE, VMWare/KVM, Baremetal)", probe_res.get("infrastructure", "Baremetal"))
+            third_party = prompt_input("Any 3rd party software installed on the nodes", probe_res.get("third_party", "None"))
+            tz = prompt_input("Customer's main time zone", default_tz)
+
+            print("\n[5/5] --- Ticket Description ---")
+            issue_desc = prompt_input("Issue description", multi_line=True, use_editor=args.editor)
+            business_impact = prompt_input("Business impact", multi_line=True, use_editor=args.editor)
+            troubleshooting = prompt_input("Troubleshooting steps", multi_line=True, use_editor=args.editor)
+            repro = prompt_input("Repro steps", default="step 1\nstep 2", multi_line=True, use_editor=args.editor)
+            workaround_avail = prompt_input("Is a workaround available and implemented?", default="no", choices=["yes", "no"])
+            workaround_text = prompt_input("What is the workaround", default="None" if workaround_avail.lower() == "no" else "", multi_line=True, use_editor=args.editor)
+            actual_beh = prompt_input("Actual behavior", multi_line=True, use_editor=args.editor)
+            expected_beh = prompt_input("Expected behavior", multi_line=True, use_editor=args.editor)
+            files_logs = prompt_input("Files, logs, traces", multi_line=True, use_editor=args.editor)
+            add_notes = prompt_input("Additional notes", multi_line=True, use_editor=args.editor)
+
+            data = {
+                "rancher_cluster": {
+                    "rancher_version": r_ver,
+                    "nodes_count": r_nodes,
+                    "node_os": r_node_os,
+                },
+                "downstream_cluster": {
+                    "downstream_count": d_count,
+                    "node_os": d_node_os,
+                    "distro_version": d_distro,
+                    "kubernetes_version": d_k8s,
+                    "cni": d_cni,
+                },
+                "longhorn": {
+                    "longhorn_version": lh_ver,
+                    "cpu_per_node": lh_cpu,
+                    "memory_per_node": lh_mem,
+                    "disk_type": lh_disk,
+                    "network_bandwidth": lh_net,
+                },
+                "other": {
+                    "infrastructure": infra,
+                    "third_party": third_party,
+                    "timezone": tz,
+                },
+                "ticket_description": {
+                    "issue_description": issue_desc,
+                    "business_impact": business_impact,
+                    "troubleshooting_steps": troubleshooting,
+                    "repro_steps": repro,
+                    "workaround_implemented": workaround_avail,
+                    "workaround_details": workaround_text,
+                    "actual_behavior": actual_beh,
+                    "expected_behavior": expected_beh,
+                    "files_logs_traces": files_logs,
+                    "additional_notes": add_notes,
+                },
+            }
+        else:
+            # Non-interactive / Auto probe mode without prompts
+            data = {
+                "rancher_cluster": {
+                    "rancher_version": probe_res.get("rancher_version") or "<version>",
+                    "nodes_count": probe_res.get("node_count") or "<number>",
+                    "node_os": probe_res.get("node_os") or "<os version>",
+                },
+                "downstream_cluster": {
+                    "downstream_count": probe_res.get("downstream_count") or "<number>",
+                    "node_os": probe_res.get("node_os") or "<os version>",
+                    "distro_version": probe_res.get("distro_version") or "<version>",
+                    "kubernetes_version": probe_res.get("kubernetes_version") or "<version>",
+                    "cni": probe_res.get("cni") or "<cni>",
+                },
+                "longhorn": {
+                    "longhorn_version": probe_res.get("longhorn_version") or "<version>",
+                    "cpu_per_node": probe_res.get("cpu_per_node") or "<cpu>",
+                    "memory_per_node": probe_res.get("memory_per_node") or "<memory>",
+                    "disk_type": "HDD/SSD/NVMe",
+                    "network_bandwidth": "<bandwidth>",
+                },
+                "other": {
+                    "infrastructure": probe_res.get("infrastructure") or "AWS/GCE, EKS/GKE, VMWare/KVM, Baremetal",
+                    "third_party": probe_res.get("third_party") or "None",
+                    "timezone": default_tz,
+                },
+                "ticket_description": {
+                    "issue_description": "<text>",
+                    "business_impact": "<text>",
+                    "troubleshooting_steps": "<text>",
+                    "repro_steps": "step 1\nstep 2",
+                    "workaround_implemented": "no",
+                    "workaround_details": "<text>",
+                    "actual_behavior": "<text>",
+                    "expected_behavior": "<text>",
+                    "files_logs_traces": "<text>",
+                    "additional_notes": "<text>",
+                },
+            }
+
+    if args.json:
+        output_content = json.dumps(data, indent=2)
+    else:
+        output_content = generate_case_markdown(data)
+
+    # Output handling
+    if show_banner:
+        print("\n" + "=" * 60)
+        print("                     Generated Support Case")
+        print("=" * 60 + "\n")
+    print(output_content)
+
+    # Save to file if requested or if output flag is set
+    out_file = args.output
+    if out_file:
+        with open(out_file, "w", encoding="utf-8") as f:
+            f.write(output_content)
+        if not args.quiet:
+            print(f"\n✓ Saved support case to: {out_file}")
+
+    # Copy to clipboard if requested
+    if args.clipboard:
+        copied, tool = copy_to_clipboard(output_content)
+        if not args.quiet:
+            if copied:
+                print(f"✓ Copied support case to clipboard (using {tool})")
+            else:
+                print("! Could not copy to clipboard (no supported clipboard utility found)")
+
+    # Compile to PDF if requested
+    if args.pdf:
+        pdf_md_file = out_file
+        cleanup_temp_md = False
+        if not pdf_md_file:
+            tf = tempfile.NamedTemporaryFile(suffix=".md", mode="w", delete=False)
+            tf.write(output_content)
+            tf.close()
+            pdf_md_file = tf.name
+            cleanup_temp_md = True
+
+        pdf_out = os.path.splitext(pdf_md_file)[0] + ".pdf" if not cleanup_temp_md else f"case-{int(time.time())}.pdf"
+
+        # Look for md2pdf
+        md2pdf_cmd = None
+        if shutil.which("md2pdf"):
+            md2pdf_cmd = "md2pdf"
+        else:
+            local_md2pdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "md2pdf")
+            if os.path.exists(local_md2pdf) and os.access(local_md2pdf, os.X_OK):
+                md2pdf_cmd = local_md2pdf
+
+        if md2pdf_cmd:
+            if not args.quiet:
+                print(f"Compiling PDF via {md2pdf_cmd} --theme {args.theme}...")
+            res = subprocess.run([md2pdf_cmd, pdf_md_file, pdf_out, "--theme", args.theme])
+            if not args.quiet:
+                if res.returncode == 0:
+                    print(f"✓ Generated PDF: {pdf_out}")
+                else:
+                    print("! Failed to compile PDF with md2pdf.")
+        else:
+            if not args.quiet:
+                print("! md2pdf command not found in PATH or script directory. Skipping PDF generation.")
+
+        if cleanup_temp_md and os.path.exists(pdf_md_file):
+            os.remove(pdf_md_file)
+
+
+if __name__ == "__main__":
+    main()

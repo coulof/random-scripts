@@ -31,6 +31,7 @@ kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/f
 *   **[check_obsidian_links.py](./check_obsidian_links.py)**: Scans an Obsidian vault recursively to detect and list broken internal links.
 *   **[audit_mixed_brackets.py](./audit_mixed_brackets.py)**: Audits an Obsidian vault to find mixed-bracket markdown link typos of the form `[[text](url)]`.
 *   **[inspect-sbom.py](./inspect-sbom.py)**: Auto-detects, parses, and queries packages, versions, and licenses from SPDX 2.0 and CycloneDX JSON SBOMs.
+*   **[collect-case-info](./collect-case-info)**: Gathers environment details (with `kubectl` auto-probing) and ticket descriptions to generate structured, submission-ready support cases for Rancher, Longhorn, and Kubernetes. Includes the OpenCode skill `support-case-collector`.
 
 ## Usage: `inspect-harvester-release.sh`
 
@@ -220,6 +221,62 @@ Options:
 # Find all packages containing "kernel" or "linux" and list their licenses
 ./inspect-sbom.py -l -f "kernel|linux" SL-Micro-Extras-6.2-x86_64-GM.cdx.json
 ```
+
+## Usage: `collect-case-info`
+
+Interactive wizard and automated cluster probing tool to collect environment specifications and structure support tickets for SUSE Rancher, Longhorn, and Kubernetes downstream clusters. Supports clipboard copying, file export, JSON export, and optional PDF compiling via `md2pdf`.
+
+```bash
+Usage: collect-case-info [options]
+
+Options:
+  -a, --auto, --probe  Probe active kubectl cluster context for environment values
+  -k, --kubeconfig <f> Path to kubeconfig file (defaults to $KUBECONFIG or ~/.kube/config)
+  --lima <instance>    Execute kubectl queries inside specified Lima VM (e.g. vpn-vm)
+  --context <name>     Specific Kubernetes context to use within the kubeconfig
+  --insecure           Skip TLS certificate verification (--insecure-skip-tls-verify)
+  --timeout <seconds>  Timeout in seconds for cluster queries (default: 25)
+  -v, --verbose        Enable verbose debug logging for cluster queries
+  -i, --interactive    Launch interactive wizard to enter or refine all details
+  -t, --template       Generate an empty skeleton template with placeholders
+  -o, --output <file>  Save the generated ticket markdown to the specified file path
+  -c, --clipboard      Copy the generated ticket markdown to clipboard (pbcopy/xclip/wl-copy)
+  -q, --quiet          Quiet mode: suppress banners and progress messages (clean output)
+  -e, --editor         Use $EDITOR for multi-line ticket descriptions during interactive mode
+  --json               Output case data as structured JSON instead of Markdown
+  --pdf                Compile the generated ticket to PDF using md2pdf
+  --theme <theme>      Theme to pass to md2pdf when --pdf is used (default: suse)
+  -h, --help           Show this help message
+```
+
+### Examples
+
+```bash
+# Print a blank support case template to stdout
+./collect-case-info -t -q
+
+# Auto-probe active cluster with a specific kubeconfig file
+./collect-case-info -a -k /path/to/cluster-kubeconfig.yaml -q
+
+# Auto-probe a cluster routed through a Lima VPN VM (e.g. vpn-vm)
+./collect-case-info -a --lima vpn-vm -k /path/to/rke2-kubeconfig.yaml -q
+
+# Auto-probe active kubectl cluster context and copy filled template to clipboard
+./collect-case-info -a -c
+
+# Run the interactive questionnaire wizard using $EDITOR for long descriptions
+./collect-case-info -i -e -o my-case.md
+
+# Auto-probe active cluster and compile directly to a SUSE-branded PDF
+./collect-case-info -a --lima vpn-vm -k cluster.yaml --pdf -o my-case.md
+
+# Export case data to JSON format
+./collect-case-info -t -q --json
+```
+
+### OpenCode Skill: `support-case-collector`
+
+The OpenCode skill is defined in **[`skills/support-case-collector/SKILL.md`](./skills/support-case-collector/SKILL.md)**. When active in an OpenCode session, you can paste raw logs, error traces, or describe issues conversationally, and the assistant will auto-probe cluster contexts, interview for missing data, and format the case directly.
 
 ## Prerequisites
 
