@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webhook-tester
+  namespace: cattle-monitoring-system
+  labels:
+    app: webhook-tester
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: webhook-tester
+  template:
+    metadata:
+      labels:
+        app: webhook-tester
+    spec:
+      containers:
+      - name: webhook-tester
+        image: ghcr.io/tarampampam/webhook-tester:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 8080
+        resources:
+          limits:
+            cpu: 100m
+            memory: 128Mi
+          requests:
+            cpu: 20m
+            memory: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: webhook-tester
+  namespace: cattle-monitoring-system
+  labels:
+    app: webhook-tester
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
+  selector:
+    app: webhook-tester

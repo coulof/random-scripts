@@ -13,6 +13,16 @@ Deploy 3 replicas of Traefik `whoami` behind a `LoadBalancer` service:
 kubectl apply -f https://raw.githubusercontent.com/coulof/random-scripts/refs/heads/main/whoami.yaml
 ```
 
+### Webhook Debugger (`webhook-tester`)
+Deploy a lightweight webhook receiver and Web UI (`ghcr.io/tarampampam/webhook-tester`) to inspect incoming HTTP payloads and alerts:
+```bash
+# Deploy
+kubectl apply -f https://raw.githubusercontent.com/coulof/random-scripts/refs/heads/main/webhook-tester.yaml
+
+# Access the Web UI
+kubectl port-forward -n cattle-monitoring-system svc/webhook-tester 8080:8080
+```
+
 ### Stateful Workload (`kbench` FIO)
 Run FIO storage benchmarks via Longhorn `kbench`:
 ```bash
@@ -23,6 +33,7 @@ kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/f
 ## Scripts
 
 *   **[whoami.yaml](./whoami.yaml)**: Stateless Kubernetes test workload with 3 `traefik/whoami` replicas behind a `LoadBalancer` service.
+*   **[webhook-tester.yaml](./webhook-tester.yaml)**: Lightweight webhook testing server and Web UI (`tarampampam/webhook-tester`) in `cattle-monitoring-system` namespace for inspecting incoming HTTP payloads and alerts.
 *   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
@@ -32,6 +43,7 @@ kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/f
 *   **[audit_mixed_brackets.py](./audit_mixed_brackets.py)**: Audits an Obsidian vault to find mixed-bracket markdown link typos of the form `[[text](url)]`.
 *   **[inspect-sbom.py](./inspect-sbom.py)**: Auto-detects, parses, and queries packages, versions, and licenses from SPDX 2.0 and CycloneDX JSON SBOMs.
 *   **[collect-case-info](./collect-case-info)**: Gathers environment details (with `kubectl` auto-probing) and ticket descriptions to generate structured, submission-ready support cases for Rancher, Longhorn, and Kubernetes. Includes the OpenCode skill `support-case-collector`.
+*   **[merge_to_pdf.py](./merge_to_pdf.py)**: Merges multiple image files (HEIC, JPG, PNG, WEBP, TIFF, etc.) into an optimized multi-page PDF with size-budget enforcement and customizable watermarking. Includes the OpenCode skill `images-to-pdf`.
 
 ## Usage: `inspect-harvester-release.sh`
 
@@ -277,6 +289,58 @@ Options:
 ### OpenCode Skill: `support-case-collector`
 
 The OpenCode skill is defined in **[`skills/support-case-collector/SKILL.md`](./skills/support-case-collector/SKILL.md)**. When active in an OpenCode session, you can paste raw logs, error traces, or describe issues conversationally, and the assistant will auto-probe cluster contexts, interview for missing data, and format the case directly.
+
+## Usage: `merge_to_pdf.py`
+
+Merges multiple images in any format (Apple HEIC photos, JPG, PNG, WEBP, TIFF, etc.) into an optimized multi-page PDF document. Features automatic EXIF auto-orientation, iterative compression to enforce a target file size budget (e.g. `< 2.0 MB`), and customizable text or image watermarking (filigrane).
+
+### Options
+
+```text
+Usage: ./merge_to_pdf.py [options] <image1> [image2 ...]
+
+Basic Options:
+  -o, --output <path>            Output PDF file path (default: merged.pdf)
+  --max-size-mb <size>           Maximum target PDF file size in MB (default: 2.0)
+  --max-dimension <pixels>       Maximum image width/height in pixels (default: 2400)
+  --quality <1-100>              Starting JPEG compression quality (default: 82)
+
+Watermark / Filigrane Options:
+  -w, --watermark <text>         Text string to watermark across pages (e.g. "CONFIDENTIEL")
+  --watermark-repeat             Tile watermark repeatedly across the page
+  --watermark-opacity <0.0-1.0>  Watermark opacity (default: 0.25)
+  --watermark-angle <degrees>    Watermark rotation angle (default: -45.0)
+  --watermark-color <name|hex>   Watermark color name or hex code (default: gray)
+  --watermark-size <points>      Watermark font size in points (default: auto)
+  --watermark-image <path>       Path to image stamp/logo to overlay centered
+  -h, --help                     Show this help message
+```
+
+### Examples
+
+```bash
+# Basic merge of mixed image formats into a single PDF
+./merge_to_pdf.py photo1.heic scan2.png receipt.jpg -o document.pdf
+
+# Merge and compress images to stay under a 1.5 MB limit
+./merge_to_pdf.py *.jpg -o portfolio.pdf --max-size-mb 1.5
+
+# Add a subtle centered watermark across all pages
+./merge_to_pdf.py contract1.png contract2.png -o draft.pdf -w "CONFIDENTIEL"
+
+# Add a repeated/tiled watermark for document protection (rental/identity files)
+./merge_to_pdf.py id1.heic id2.heic -o dossier.pdf -w "DOSSIER LOCATION 2026" --watermark-repeat --max-size-mb 1.0
+
+# Add a custom colored stamp with custom opacity
+./merge_to_pdf.py scan.jpg -o out.pdf -w "ANNULÉ" --watermark-color red --watermark-opacity 0.35
+
+# Overlay an image stamp/logo
+./merge_to_pdf.py page1.png page2.png -o certified.pdf --watermark-image stamp.png
+```
+
+### OpenCode Skill: `images-to-pdf`
+
+The OpenCode skill is defined in **[`skills/images-to-pdf/SKILL.md`](./skills/images-to-pdf/SKILL.md)**. When active, you can ask the assistant to combine photos/scans into a PDF, apply watermarks/filigranes, and ensure files meet size restrictions for online portals.
 
 ## Prerequisites
 
