@@ -1,0 +1,31 @@
+apiVersion: upgrade.cattle.io/v1
+kind: Plan
+metadata:
+  name: cluster-rolling-reboot
+  namespace: cattle-system
+spec:
+  # Sequential reboot: one node at a time
+  concurrency: 1
+  # Targets all managed nodes in Harvester
+  nodeSelector:
+    matchLabels:
+      harvesterhci.io/managed: "true"
+  serviceAccountName: system-upgrade-controller
+  tolerations:
+  - effect: NoExecute
+    operator: Exists
+  - effect: NoSchedule
+    operator: Exists
+  upgrade:
+    image: registry.suse.com/bci/bci-base:16.0
+    command:
+    - /bin/sh
+    - -c
+    args:
+    - |
+      echo "=== Scheduling rolling reboot on node: $(hostname) ==="
+      # Schedule reboot with systemd-run on host root with a 5s delay so the pod terminates cleanly
+      chroot /host /usr/bin/systemd-run --on-active=5 /usr/bin/systemctl reboot
+      echo "Reboot command dispatched to host."
+  # Increment or update version to trigger execution on demand
+  version: v1.0.0

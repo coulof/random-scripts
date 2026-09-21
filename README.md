@@ -30,10 +30,25 @@ Run FIO storage benchmarks via Longhorn `kbench`:
 kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/fio.yaml
 ```
 
+### Cluster Rolling Reboot (`harvester-rolling-reboot-plan`)
+Perform a safe, sequential rolling reboot of Harvester / RKE2 cluster nodes using the built-in System Upgrade Controller (`system-upgrade-controller`):
+```bash
+# Apply the Plan
+kubectl apply -f harvester-rolling-reboot-plan.yaml
+
+# Trigger an on-demand rolling reboot
+kubectl patch plan cluster-rolling-reboot -n cattle-system --type=merge \
+  -p "{\"spec\":{\"version\":\"$(date +%Y%m%d%H%M%S)\"}}"
+
+# Watch reboot progress in real-time
+kubectl get pods -n cattle-system -l upgrade.cattle.io/plan=cluster-rolling-reboot -w
+```
+
 ## Scripts
 
 *   **[whoami.yaml](./whoami.yaml)**: Stateless Kubernetes test workload with 3 `traefik/whoami` replicas behind a `LoadBalancer` service.
 *   **[webhook-tester.yaml](./webhook-tester.yaml)**: Lightweight webhook testing server and Web UI (`tarampampam/webhook-tester`) in `cattle-monitoring-system` namespace for inspecting incoming HTTP payloads and alerts.
+*   **[harvester-rolling-reboot-plan.yaml](./harvester-rolling-reboot-plan.yaml)**: Sequential rolling reboot plan for Harvester / RKE2 cluster nodes using System Upgrade Controller (`system-upgrade-controller`).
 *   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
