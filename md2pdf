@@ -66,6 +66,24 @@ const KATEX_SCRIPTS = [
 // which exposes window.mermaid — that's what we use here.
 const MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist";
 
+// Sanitizes Mermaid code to fix common syntax issues that break Mermaid's strict parser:
+// 1. Unquoted edge labels containing brackets/parentheses in flowcharts:
+//    Mermaid grammar treats unquoted (, ), [, ], {, } in |label| as node shapes (PS/SQE/etc).
+//    Example: -->|Label (info)| ==> -->|"Label (info)"|
+function sanitizeMermaid(code) {
+  return code.replace(
+    /((?:-->|---|-.->|==>|<-+>|<==>|<-\.->|--o|--x|o--o|x--x|[=\-.>o<x]{2,}))\s*\|([^"\n|]+?)\|/g,
+    (match, arrow, label) => {
+      const trimmed = label.trim();
+      if (/[()\[\]{}]/.test(trimmed)) {
+        const escaped = trimmed.replace(/"/g, "#quot;");
+        return `${arrow}|"${escaped}"|`;
+      }
+      return match;
+    }
+  );
+}
+
 const MERMAID_SCRIPTS = [
   { url: `${MERMAID_CDN}/mermaid.min.js` },
   // DOM safety net: if any mermaid block still rendered as <code class="language-mermaid">
@@ -73,6 +91,19 @@ const MERMAID_SCRIPTS = [
   {
     content: `
       (function fixMermaidBlocks() {
+        function sanitize(code) {
+          return code.replace(
+            /((?:-->|---|-.->|==>|<-+>|<==>|<-\\.->|--o|--x|o--o|x--x|[=\\-.>o<x]{2,}))\\s*\\|([^"\\n|]+?)\\|/g,
+            function(match, arrow, label) {
+              var trimmed = label.trim();
+              if (/[()\\[\\]{}]/.test(trimmed)) {
+                var escaped = trimmed.replace(/"/g, '#quot;');
+                return arrow + '|"' + escaped + '"|';
+              }
+              return match;
+            }
+          );
+        }
         document.querySelectorAll('code[class*="mermaid"], code[class*="language-mermaid"]').forEach(function(code) {
           var pre = code.parentElement;
           if (!pre || pre.tagName !== 'PRE') return;
@@ -84,7 +115,7 @@ const MERMAID_SCRIPTS = [
             .replace(/&#39;/g, "'");
           var newPre = document.createElement('pre');
           newPre.className = 'mermaid';
-          newPre.textContent = txt;
+          newPre.textContent = sanitize(txt);
           pre.parentNode.replaceChild(newPre, pre);
         });
       })();
@@ -117,7 +148,7 @@ const MERMAID_MARKED_EXTENSION = {
     // (highlight.js only runs for languages it recognises — not "mermaid").
     code(code, lang) {
       if (lang === "mermaid") {
-        return `<pre class="mermaid">${code}</pre>\n`;
+        return `<pre class="mermaid">${sanitizeMermaid(code)}</pre>\n`;
       }
       return false;
     },
