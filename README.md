@@ -1,6 +1,6 @@
 # Random Scripts 🛠️
 
-A collection of utility scripts for Git automation, Homebrew setup, Kubernetes workloads, and SUSE/Harvester kernel extraction.
+A collection of utility scripts for Git automation, Homebrew setup, Kubernetes workloads, OpenCode session navigation, and SUSE/Harvester kernel extraction.
 
 ## Kubernetes Test Workloads 🧪
 
@@ -59,6 +59,7 @@ kubectl get pods -n cattle-system -l upgrade.cattle.io/plan=cluster-rolling-rebo
 *   **[inspect-sbom.py](./inspect-sbom.py)**: Auto-detects, parses, and queries packages, versions, and licenses from SPDX 2.0 and CycloneDX JSON SBOMs.
 *   **[collect-case-info](./collect-case-info)**: Gathers environment details (with `kubectl` auto-probing) and ticket descriptions to generate structured, submission-ready support cases for Rancher, Longhorn, and Kubernetes. Includes the OpenCode skill `support-case-collector`.
 *   **[merge_to_pdf.py](./merge_to_pdf.py)**: Merges multiple image files (HEIC, JPG, PNG, WEBP, TIFF, etc.) into an optimized multi-page PDF with size-budget enforcement and customizable watermarking. Includes the OpenCode skill `images-to-pdf`.
+*   **[opencode-fzf](./opencode-fzf)**: Fast fuzzy finder and full-text search (SQLite FTS5) front-end for OpenCode sessions with live syntax-highlighted previews and instant session resume.
 
 ## Usage: `inspect-harvester-release.sh`
 
@@ -356,6 +357,69 @@ Watermark / Filigrane Options:
 ### OpenCode Skill: `images-to-pdf`
 
 The OpenCode skill is defined in **[`skills/images-to-pdf/SKILL.md`](./skills/images-to-pdf/SKILL.md)**. When active, you can ask the assistant to combine photos/scans into a PDF, apply watermarks/filigranes, and ensure files meet size restrictions for online portals.
+
+## Usage: `opencode-fzf`
+
+An interactive terminal UI front-end for OpenCode sessions powered by `fzf` and an incremental SQLite FTS5 full-text index. Allows instant browsing, full-text content searching across transcripts, and one-key session resumption.
+
+![opencode-fzf session browser and search](./assets/opencode-fzf.png)
+
+### Key Features
+
+*   **Fuzzy Session Browser**: Filter sessions by date, workspace directory, or session title.
+*   **Full-Text Search (`-g`)**: Search message transcripts in real time with BM25 relevance ranking and prefix matching.
+*   **Rich Live Preview**: Displays session metadata (session ID, directory, model, token usage, cost) alongside full markdown transcripts (syntax-highlighted with `bat` when installed).
+*   **Instant Resumption**: Press `Enter` to resume the selected session (`opencode -s <id>`) or `Alt-n` to launch a new session in the target directory.
+*   **Safe & Non-Destructive**: Attaches OpenCode's SQLite database strictly read-only and maintains an external incremental search index (`~/.cache/ocf/index.db`).
+
+### Installation & Alias
+
+Make executable and optionally symlink to your `$PATH` as `ocf`:
+
+```bash
+chmod +x opencode-fzf
+ln -s "$(pwd)/opencode-fzf" ~/.local/bin/ocf
+```
+
+### Commands
+
+```bash
+# Browse all sessions (fuzzy search on title, directory, date)
+./opencode-fzf [query]
+
+# Full-text search across all message contents
+./opencode-fzf -g [query]
+
+# Check database schema compatibility
+./opencode-fzf doctor
+
+# Update or rebuild the search index manually
+./opencode-fzf index [--rebuild]
+```
+
+### Keybindings
+
+| Key | Action |
+| :--- | :--- |
+| `Enter` | Resume selected session in its working directory |
+| `Alt-n` | Launch a new OpenCode session in the selected directory |
+| `Ctrl-g` | Toggle between session browsing and full-text search modes |
+| `Ctrl-d` / `Ctrl-u` | Scroll preview pane half-page down / up |
+| `Ctrl-t` / `Ctrl-b` | Jump preview pane to top / bottom |
+
+### Environment Variables
+
+| Variable | Default | Description |
+| :--- | :--- | :--- |
+| `OPENCODE_DB` | `~/.local/share/opencode/opencode.db` | Path to OpenCode's SQLite database |
+| `OCF_INDEX` | `~/.cache/ocf/index.db` | Path to sidecar SQLite FTS5 search index |
+| `OCF_DIR_WIDTH` | `28` | Truncation width for the directory column |
+
+### Requirements
+
+*   `fzf` (>= 0.38)
+*   `sqlite3` with FTS5 support (>= 3.35)
+*   `bat` (optional, enables syntax-highlighted markdown preview)
 
 ## Prerequisites
 

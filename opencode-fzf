@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# ocf — fzf front-end for opencode sessions, with an FTS5 full-text index.
+#
+#   ocf [query]          browse all sessions (fuzzy on date/dir/title)
+#   ocf -g [query]       full-text search over message content (bm25-ranked, live)
+#   ocf index [--rebuild]  update the sidecar index (auto-run by the two above)
+#   ocf doctor           check the opencode schema matches what ocf expects
+#
+# Search syntax (-g): words are AND-ed and prefix-matched; "-word" excludes.
+# Keys: enter resume · alt-n new session in that dir · ctrl-g toggle browse/search
+#       ctrl-d/u scroll preview · ctrl-t/b preview top/bottom
+#
+# Never writes to opencode's DB: it is attached read-only; the index lives in
+# a separate SQLite file and is rebuilt incrementally from part.time_updated.
+#
+# Env: OCF_DIR_WIDTH (default 28) width of the directory column
+#      OPENCODE_DB  (default ~/.local/share/opencode/opencode.db)
+#      OCF_INDEX    (default ~/.cache/ocf/index.db)
+# Needs: sqlite3 with FTS5 (>=3.35), fzf >= 0.38. Optional: bat (markdown preview).
+set -euo pipefail
+
+OC_DB="${OPENCODE_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db}"
+IDX="${OCF_INDEX:-${XDG_CACHE_HOME:-$HOME/.cache}/ocf/index.db}"
+SELF="$(realpath "$0")"
+IDX_VERSION=1
+HL1='⟪'; HL2='⟫'; NL='␤'   # printable sentinels; never emit control chars from SQL
+E=$'\e'; B="${E}[1m"; D="${E}[2m"; Y="${E}[33m"; C="${E}[36m"; G="${E}[32m"; R="${E}[1;31m"; X="${E}[0m"
+
+die() { printf 'ocf: %s\n' "$*" >&2; exit 1; }
+[ -r "$OC_DB" ] || die "opencode DB not found at $OC_DB (set OPENCODE_DB)"
+command -v sqlite3 >/dev/null || die "sqlite3 not found"
+mkdir -p "$(dirname "$IDX")"
+
+# SQL against the index, with opencode's DB attached read-only as "oc".
+sq() {
+  sqlite3 -batch -noheader -separator $'\t' \
+    -cmd ".timeout 3000" -cmd "ATTACH 'file:$OC_DB?mode=ro' AS oc" "$IDX" "$1"
+}
+
+has_col() {  # has_col table column  -> exit status
+  [ "$(sq "SELECT count(*) FROM pragma_table_info('$1','oc') WHERE name='$2'")" = 1 ]
+}
+
+subagent_filter() {
+  if has_col session parent_id; then echo "s.parent_id IS NULL"
+  else echo "coalesce(s.title,'') NOT LIKE '%subagent)'"; fi
+}
+
+# ── index ──────────────────────────────────────────────────────────────────
+init_index() {
+  local v; v="$(sq "SELECT v FROM meta WHERE k='ver'" 2>/dev/null || true)"
+  if [ "$v" != "$IDX_VERSION" ]; then rm -f "$IDX" "$IDX-wal" "$IDX-shm"; fi
+  sq "
+  PRAGMA journal_mode=WAL;
+  CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v);
+  CREATE TABLE IF NOT EXISTS doc(
+    rowid INTEGER PRIMARY KEY, part_id TEXT UNIQUE, session_id TEXT,
+    role TEXT, t INTEGER, text TEXT);
+  CREATE INDEX IF NOT EXISTS doc_sid ON doc(session_id, t);
+  CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
+    text, content='doc', content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 2', prefix='2 3');
+  CREATE TRIGGER IF NOT EXISTS doc_ai AFTER INSERT ON doc BEGIN
+    INSERT INTO fts(rowid, text) VALUES (new.rowid, new.text); END;
+  CREATE TRIGGER IF NOT EXISTS doc_ad AFTER DELETE ON doc BEGIN
+    INSERT INTO fts(fts, rowid, text) VALUES ('delete', old.rowid, old.text); END;
+  CREATE TRIGGER IF NOT EXISTS doc_au AFTER UPDATE ON doc BEGIN
+    INSERT INTO fts(fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+    INSERT INTO fts(rowid, text) VALUES (new.rowid, new.text); END;
+  INSERT OR REPLACE INTO meta VALUES ('ver', $IDX_VERSION);" >/dev/null
+}
+
+cmd_index() {
+  [ "${1:-}" = "--rebuild" ] && rm -f "$IDX" "$IDX-wal" "$IDX-shm"
+  init_index
+  [ -z "$(sq "SELECT v FROM meta WHERE k='wm'")" ] && printf 'ocf: building index…\n' >&2
+  # Window (old_wm, new_wm]: new_wm is fixed up front so parts written during
+  # the run are picked up next time instead of being skipped.
+  sq "
+  BEGIN;
+  CREATE TEMP TABLE w AS SELECT
+    coalesce((SELECT v FROM meta WHERE k='wm'), 0) AS lo,
+    coalesce((SELECT max(time_updated) FROM oc.part), 0) AS hi;
+  INSERT INTO doc(part_id, session_id, role, t, text)
+  SELECT p.id, p.session_id,
+         coalesce(json_extract(m.data,'\$.role'),
+                  CASE WHEN json_extract(p.data,'\$.time') IS NOT NULL THEN 'assistant' ELSE 'user' END),
+         p.time_updated, json_extract(p.data,'\$.text')
+  FROM oc.part p LEFT JOIN oc.message m ON m.id = p.message_id, w
+  WHERE p.time_updated > w.lo AND p.time_updated <= w.hi
+    AND json_extract(p.data,'\$.type') = 'text'
+    AND coalesce(json_extract(p.data,'\$.synthetic'), 0) = 0
+    AND length(coalesce(json_extract(p.data,'\$.text'), '')) > 0
+  ON CONFLICT(part_id) DO UPDATE SET text=excluded.text, t=excluded.t, role=excluded.role;
+  DELETE FROM doc WHERE session_id NOT IN (SELECT id FROM oc.session);
+  INSERT OR REPLACE INTO meta SELECT 'wm', hi FROM w;
+  COMMIT;" >/dev/null
+}
+
+# ── listing / search ──────────────────────────────────────────────────────
+active_ids() {  # sessions resumed with -s/--session (fresh TUI sessions are invisible)
+  ps -eo args 2>/dev/null | awk '$0 ~ /(^|\/| )opencode( |$)/ {
+    for (i = 1; i < NF; i++) if ($i == "-s" || $i == "--session") print $(i+1) }' | sort -u
+}
+
+# in:  id \t dir \t title [\t hits \t snippet]
+# out: id \t <dir, padded/colored> \t <● title> [\t <hits> \t <snippet>]
+fmt_rows() {
+  local w="${OCF_DIR_WIDTH:-28}"
+  awk -F'\t' -v OFS='\t' -v w="$w" -v ids="$(active_ids | tr '\n' ' ')" \
+      -v r="$R" -v c="$C" -v d="$D" -v hl="$Y$B" -v x="$X" -v h1="$HL1" -v h2="$HL2" '
+    BEGIN { n = split(ids, a, " "); for (i = 1; i <= n; i++) act[a[i]] = 1 }
+    { dir = $2
+      if (length(dir) > w) dir = "…" substr(dir, length(dir) - w + 2)
+      while (length(dir) < w) dir = dir " "
+      out = $1 OFS c dir x OFS (($1 in act) ? r "●" x " " : "  ") $3
+      if (NF >= 5) { s = $5; gsub(h1, hl, s); gsub(h2, x, s); out = out OFS d $4 "×" x OFS s }
+      print out }'
+}
+
+ROW="s.id, replace(s.directory,'$HOME','~'),
+     replace(replace(coalesce(s.title,'(untitled)'), char(9), ' '), char(10), ' ')"
+
+cmd_list() {
+  sq "SELECT $ROW FROM oc.session s WHERE $(subagent_filter)
+      ORDER BY s.time_updated DESC" | fmt_rows
+}
+
+# Turn free text into a safe FTS5 query: "a"* "b"* NOT "c"*
+fts_query() {
+  local -a words; local w pos="" neg=""
+  read -ra words <<<"$1" || true
+  for w in "${words[@]}"; do
+    w="${w//\"/}"
+    if [[ "$w" == -?* ]]; then neg+=" NOT \"${w:1}\"*"
+    elif [ -n "$w" ]; then pos+=" \"$w\"*"; fi
+  done
+  if [ -n "$pos" ]; then printf '%s' "${pos# }$neg"; fi
+}
+
+cmd_grep() {
+  local q; q="$(fts_query "${1:-}")"; [ -z "$q" ] && return 0
+  q="${q//\'/\'\'}"
+  sq "
+  WITH hits AS (
+    SELECT d.session_id sid, bm25(fts) r,
+      replace(replace(replace(snippet(fts, 0, '$HL1', '$HL2', '…', 12), char(13), ''), char(10), ' '), char(9), ' ') snip
+    FROM fts JOIN doc d ON d.rowid = fts.rowid
+    WHERE fts MATCH '$q' ORDER BY r LIMIT 5000),
+  best AS (
+    SELECT sid, snip, r,
+      row_number() OVER (PARTITION BY sid ORDER BY r) rn,
+      count(*)     OVER (PARTITION BY sid) n
+    FROM hits)
+  SELECT $ROW, b.n, b.snip
+  FROM best b JOIN oc.session s ON s.id = b.sid
+  WHERE b.rn = 1 AND $(subagent_filter)
+  ORDER BY b.r LIMIT 300" | fmt_rows
+}
+
+# ── preview ───────────────────────────────────────────────────────────────
+cmd_preview() {
+  local sid="$1" query="${2:-}"
+  [[ "$sid" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+
+  local cols="replace(replace(s.title, char(9), ' '), char(10), ' '), s.id, replace(s.directory,'$HOME','~'),
+    datetime(s.time_created/1000,'unixepoch','localtime'),
+    datetime(s.time_updated/1000,'unixepoch','localtime')"
+  has_col session agent && cols+=", coalesce(s.agent,'?')||' · '||coalesce(json_extract(s.model,'\$.id'), s.model, '?')" || cols+=", ''"
+  has_col session cost  && cols+=", printf('in %d · out %d · cache %d · \$%.4f',
+    coalesce(s.tokens_input,0), coalesce(s.tokens_output,0),
+    coalesce(s.tokens_cache_read,0)+coalesce(s.tokens_cache_write,0), coalesce(s.cost,0))" || cols+=", ''"
+
+  sq "SELECT $cols FROM oc.session s WHERE s.id='$sid'" | awk -F'\t' -v b="$B" -v y="$Y" -v x="$X" '
+    { split("Title Session Dir Created Updated Agent Usage", L, " ")
+      for (i = 1; i <= 7; i++) if ($i != "") printf "%s%-8s%s %s%s%s\n", y, L[i], x, (i==1?b:""), $i, x }'
+  active_ids | grep -qx "$sid" && printf '%s%-8s%s %s● ACTIVE%s\n' "$Y" Status "$X" "$R" "$X"
+
+  local q; q="$(fts_query "$query")"
+  if [ -n "$q" ]; then
+    q="${q//\'/\'\'}"
+    printf '\n%s── matches ──%s\n' "$D" "$X"
+    sq "SELECT upper(substr(d.role,1,1)),
+          replace(replace(replace(snippet(fts, 0, '$HL1', '$HL2', '…', 24), char(13), ''), char(10), ' '), char(9), ' ')
+        FROM fts JOIN doc d ON d.rowid = fts.rowid
+        WHERE fts MATCH '$q' AND d.session_id='$sid' ORDER BY bm25(fts) LIMIT 15" \
+      | awk -F'\t' -v c="$C" -v g="$G" -v x="$X" -v hl="$Y$B" -v h1="$HL1" -v h2="$HL2" \
+          '{ s = $2; gsub(h1, hl, s); gsub(h2, x, s); printf "%s%s%s %s\n", ($1=="U"?c:g), $1, x, s }'
+  fi
+
+  printf '\n%s── transcript ──%s\n\n' "$D" "$X"
+  local render=(cat)
+  command -v bat >/dev/null && render=(bat -l md --color=always --style=plain --paging=never)
+  # Text from the index (no JSON parsing at preview time); consecutive parts of
+  # the same role are collapsed under one heading.
+  sq "SELECT role, strftime('%H:%M', t/1000, 'unixepoch', 'localtime'),
+        replace(replace(replace(text, char(13), ''), char(9), '    '), char(10), '$NL') FROM doc WHERE session_id='$sid' ORDER BY t, rowid" \
+    | awk -F'\t' -v nl="$NL" '{ if ($1 != last) printf "### ▌ %s  %s\n\n", toupper($1), $2
+                    last = $1; gsub(nl, "\n", $3); print $3; print "" }' \
+    | "${render[@]}"
+}
+
+# ── doctor ────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  local ok=0 t c n=0
+  printf 'opencode DB: %s\nindex:       %s\n\n' "$OC_DB" "$IDX"
+  for spec in "session:id directory title time_created time_updated" \
+              "part:id session_id message_id time_updated data" \
+              "message:id data" \
+              "session:parent_id agent model cost tokens_input tokens_output tokens_cache_read tokens_cache_write"; do
+    t="${spec%%:*}"; n=$((n+1))
+    for c in ${spec#*:}; do
+      if has_col "$t" "$c"; then printf '  %sok%s       %s.%s\n' "$G" "$X" "$t" "$c"
+      else printf '  %smissing%s  %s.%s\n' "$R" "$X" "$t" "$c"; [ $n -lt 4 ] && ok=1; fi
+    done
+  done
+  printf '\n(the last group is optional: preview/filter degrade gracefully)\n'
+  printf 'text parts: %s · indexed: %s\n' \
+    "$(sq "SELECT count(*) FROM oc.part WHERE json_extract(data,'\$.type')='text'")" \
+    "$(sq "SELECT count(*) FROM doc" 2>/dev/null || echo 0)"
+  return $ok
+}
+
+# ── fzf UI ────────────────────────────────────────────────────────────────
+run_fzf() {  # run_fzf <browse|grep> <query>
+  local mode="$1" query="${2:-}" out key line id dir
+  local -a args=(
+    --ansi --reverse --delimiter=$'\t' --with-nth=2.. --nth=1,2 --query "$query"
+    --preview-window 'right,60%,wrap' --expect alt-n
+    --bind 'ctrl-d:preview-half-page-down,ctrl-u:preview-half-page-up'
+    --bind 'ctrl-t:preview-top,ctrl-b:preview-bottom'
+  )
+  if [ "$mode" = grep ]; then
+    args+=(--disabled --prompt 'content> '
+      --header 'enter resume · alt-n new · ctrl-g browse · "-word" excludes'
+      --bind "start:reload:$SELF _grep {q}" --bind "change:reload:$SELF _grep {q}"
+      --bind "ctrl-g:become($SELF {q})" --preview "$SELF _preview {1} {q}")
+    out="$(: | fzf "${args[@]}")" || return 0
+  else
+    args+=(--prompt 'session> ' --tiebreak=index
+      --header 'enter resume · alt-n new · ctrl-g content search'
+      --bind "ctrl-g:become($SELF -g {q})" --preview "$SELF _preview {1}" --no-sort)
+    out="$(cmd_list | fzf "${args[@]}")" || return 0
+  fi
+
+  key="$(head -n1 <<<"$out")"; line="$(sed -n 2p <<<"$out")"
+  id="$(cut -f1 <<<"$line")"; [ -n "$id" ] || return 0
+  dir="$(sq "SELECT directory FROM oc.session WHERE id='${id//\'/}'")"
+  cd "$dir" 2>/dev/null || die "directory gone: $dir"
+  if [ "$key" = alt-n ]; then exec opencode; else exec opencode -s "$id"; fi
+}
+
+case "${1:-}" in
+  _list)    cmd_list ;;
+  _grep)    cmd_grep "${2:-}" ;;
+  _preview) cmd_preview "${2:-}" "${3:-}" ;;
+  index)    cmd_index "${2:-}" ;;
+  doctor)   cmd_index >/dev/null 2>&1 || true; cmd_doctor ;;
+  -g)       command -v fzf >/dev/null || die "fzf not found"; cmd_index; run_fzf grep "${2:-}" ;;
+  -h|--help) sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *)        command -v fzf >/dev/null || die "fzf not found"; cmd_index; run_fzf browse "${1:-}" ;;
+esac
