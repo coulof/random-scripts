@@ -1,0 +1,94 @@
+# Rolling reboot of a Rancher-provisioned RKE2 guest cluster running on Harvester
+# (Harvester node driver + Harvester Cloud Provider + Harvester CSI).
+#
+# Before triggering: take an etcd snapshot and disable "Auto Replace" on the
+# Rancher machine pools, otherwise a rebooting node may be replaced.
+#
+# Two plans (etcd nodes / everything else), both exclusive: SUC never runs
+# their jobs at the same time, so only one node is down across the cluster.
+#
+# Single List document so the &reboot anchor is shared by both plans.
+apiVersion: v1
+kind: List
+items:
+- apiVersion: upgrade.cattle.io/v1
+  kind: Plan
+  metadata:
+    name: rke2-reboot-servers
+    namespace: cattle-system
+  spec:
+    concurrency: 1
+    exclusive: true
+    # Drain + reboot + retried pod; SUC default deadline is 600s
+    jobActiveDeadlineSecs: 1800
+    nodeSelector:
+      matchExpressions:
+      - key: node-role.kubernetes.io/etcd
+        operator: Exists
+    serviceAccountName: system-upgrade-controller
+    tolerations:
+    - effect: NoExecute
+      operator: Exists
+    - effect: NoSchedule
+      operator: Exists
+    # Drain first so Harvester CSI can unplug PVC volumes from the VM cleanly
+    drain:
+      force: true
+      ignoreDaemonSets: true
+      deleteEmptydirData: true
+      timeout: 600s
+    upgrade: &reboot
+      image: registry.suse.com/bci/bci-base:16.0
+      command:
+      - /bin/sh
+      - -c
+      args:
+      - |
+        # The job must only succeed once the node is back, otherwise the controller
+        # moves on to the next node while this one is still rebooting.
+        # 1st run: record boot_id and reboot. The pod dies with the node and the Job
+        # retries it after reboot. 2nd run: boot_id changed, the reboot is done.
+        STATE_DIR=/host/var/lib/suc-reboot
+        STATE="${STATE_DIR}/${SYSTEM_UPGRADE_PLAN_NAME}"
+        BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
+        if [ -f "${STATE}" ] && [ "$(cut -d' ' -f1 "${STATE}")" = "${SYSTEM_UPGRADE_PLAN_LATEST_HASH}" ]; then
+          if [ "$(cut -d' ' -f2 "${STATE}")" != "${BOOT_ID}" ]; then
+            echo "=== Node ${SYSTEM_UPGRADE_NODE_NAME} rebooted, letting it settle ==="
+            sleep 60
+            exit 0
+          fi
+        fi
+        mkdir -p "${STATE_DIR}"
+        echo "${SYSTEM_UPGRADE_PLAN_LATEST_HASH} ${BOOT_ID}" > "${STATE}"
+        echo "=== Rebooting node: ${SYSTEM_UPGRADE_NODE_NAME} ==="
+        chroot /host /usr/bin/systemd-run --on-active=5 /usr/bin/systemctl reboot
+        sleep infinity
+    # Increment or update version to trigger execution on demand
+    version: v1.0.0
+- apiVersion: upgrade.cattle.io/v1
+  kind: Plan
+  metadata:
+    name: rke2-reboot-agents
+    namespace: cattle-system
+  spec:
+    concurrency: 1
+    exclusive: true
+    jobActiveDeadlineSecs: 1800
+    nodeSelector:
+      matchExpressions:
+      - key: node-role.kubernetes.io/etcd
+        operator: DoesNotExist
+    serviceAccountName: system-upgrade-controller
+    tolerations:
+    - effect: NoExecute
+      operator: Exists
+    - effect: NoSchedule
+      operator: Exists
+    drain:
+      force: true
+      ignoreDaemonSets: true
+      deleteEmptydirData: true
+      timeout: 600s
+    upgrade: *reboot
+    # Keep in sync with rke2-reboot-servers
+    version: v1.0.0

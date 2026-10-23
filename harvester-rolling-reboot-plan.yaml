@@ -6,6 +6,8 @@ metadata:
 spec:
   # Sequential reboot: one node at a time
   concurrency: 1
+  # Drain (VM live migrations) + reboot + retried pod; SUC default deadline is 600s
+  jobActiveDeadlineSecs: 5400
   # Targets all managed nodes in Harvester
   nodeSelector:
     matchLabels:
@@ -16,6 +18,14 @@ spec:
     operator: Exists
   - effect: NoSchedule
     operator: Exists
+  # Evicting virt-launcher pods live-migrates the VMs off the node. Non-migratable
+  # VMs (PCI/vGPU passthrough, node affinity) and Longhorn's last healthy replica
+  # block the drain: the job fails and the plan stops instead of rebooting.
+  drain:
+    force: true
+    ignoreDaemonSets: true
+    deleteEmptydirData: true
+    timeout: 3600s
   upgrade:
     image: registry.suse.com/bci/bci-base:16.0
     command:
@@ -23,9 +33,24 @@ spec:
     - -c
     args:
     - |
-      echo "=== Scheduling rolling reboot on node: $(hostname) ==="
-      # Schedule reboot with systemd-run on host root with a 5s delay so the pod terminates cleanly
+      # The job must only succeed once the node is back, otherwise the controller
+      # moves on to the next node while this one is still rebooting.
+      # 1st run: record boot_id and reboot. The pod dies with the node and the Job
+      # retries it after reboot. 2nd run: boot_id changed, the reboot is done.
+      STATE_DIR=/host/var/lib/suc-reboot
+      STATE="${STATE_DIR}/${SYSTEM_UPGRADE_PLAN_NAME}"
+      BOOT_ID=$(cat /proc/sys/kernel/random/boot_id)
+      if [ -f "${STATE}" ] && [ "$(cut -d' ' -f1 "${STATE}")" = "${SYSTEM_UPGRADE_PLAN_LATEST_HASH}" ]; then
+        if [ "$(cut -d' ' -f2 "${STATE}")" != "${BOOT_ID}" ]; then
+          echo "=== Node ${SYSTEM_UPGRADE_NODE_NAME} rebooted, letting it settle ==="
+          sleep 60
+          exit 0
+        fi
+      fi
+      mkdir -p "${STATE_DIR}"
+      echo "${SYSTEM_UPGRADE_PLAN_LATEST_HASH} ${BOOT_ID}" > "${STATE}"
+      echo "=== Rebooting node: ${SYSTEM_UPGRADE_NODE_NAME} ==="
       chroot /host /usr/bin/systemd-run --on-active=5 /usr/bin/systemctl reboot
-      echo "Reboot command dispatched to host."
+      sleep infinity
   # Increment or update version to trigger execution on demand
   version: v1.0.0

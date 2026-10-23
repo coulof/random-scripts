@@ -31,7 +31,9 @@ kubectl apply -f https://raw.githubusercontent.com/longhorn/kbench/main/deploy/f
 ```
 
 ### Cluster Rolling Reboot (`harvester-rolling-reboot-plan`)
-Perform a safe, sequential rolling reboot of Harvester / RKE2 cluster nodes using the built-in System Upgrade Controller (`system-upgrade-controller`):
+Reboots Harvester nodes one at a time with the built-in System Upgrade Controller (`system-upgrade-controller`). Each node is drained, which live-migrates its VMs, then rebooted and uncordoned once it is back up.
+
+Shut down VMs that can't live-migrate (PCI/vGPU passthrough, node affinity) first. Otherwise they block the drain and the plan stops on that node.
 ```bash
 # Apply the Plan
 kubectl apply -f harvester-rolling-reboot-plan.yaml
@@ -44,11 +46,32 @@ kubectl patch plan cluster-rolling-reboot -n cattle-system --type=merge \
 kubectl get pods -n cattle-system -l upgrade.cattle.io/plan=cluster-rolling-reboot -w
 ```
 
+### Guest Cluster Rolling Reboot (`rke2-guest-rolling-reboot-plan`)
+Reboots the nodes of a Rancher-provisioned RKE2 cluster on Harvester one at a time. Each node is drained, rebooted, and uncordoned only after it is back up.
+
+Before you run it, take an etcd snapshot and turn off **Auto Replace** on the Rancher machine pools. Rancher deletes and reprovisions a node that stays NotReady too long. Turn it back on afterwards.
+```bash
+# Apply the Plans (on the guest cluster)
+kubectl apply -f rke2-guest-rolling-reboot-plan.yaml
+
+# Trigger an on-demand rolling reboot (bump both plans to the same version)
+V=$(date +%Y%m%d%H%M%S)
+for p in rke2-reboot-servers rke2-reboot-agents; do
+  kubectl patch plan $p -n cattle-system --type=merge -p "{\"spec\":{\"version\":\"$V\"}}"
+done
+
+# Watch reboot progress in real-time
+kubectl get nodes -w
+kubectl get pods -n cattle-system -l upgrade.cattle.io/controller=system-upgrade-controller -w
+```
+> The plans rely on `exclusive` and `jobActiveDeadlineSecs`. An older system-upgrade-controller CRD drops unknown fields silently, and the two plans could then reboot two nodes at once. Check first: `kubectl explain plan.spec.exclusive`.
+
 ## Scripts
 
 *   **[whoami.yaml](./whoami.yaml)**: Stateless Kubernetes test workload with 3 `traefik/whoami` replicas behind a `LoadBalancer` service.
 *   **[webhook-tester.yaml](./webhook-tester.yaml)**: Lightweight webhook testing server and Web UI (`tarampampam/webhook-tester`) in `cattle-monitoring-system` namespace for inspecting incoming HTTP payloads and alerts.
 *   **[harvester-rolling-reboot-plan.yaml](./harvester-rolling-reboot-plan.yaml)**: Sequential rolling reboot plan for Harvester / RKE2 cluster nodes using System Upgrade Controller (`system-upgrade-controller`).
+*   **[rke2-guest-rolling-reboot-plan.yaml](./rke2-guest-rolling-reboot-plan.yaml)**: Drains and reboots the nodes of a Rancher-provisioned RKE2 cluster on Harvester, one at a time, and waits for each node to come back.
 *   **[inspect-harvester-release.sh](./inspect-harvester-release.sh)**: Extracts the kernel version from a Harvester release squashfs image without deploying a node.
 *   **[git-all](./git-all)**: Runs specified Git operations (`pull`, `gc`, or `status`) on all Git repositories found recursively under a directory.
 *   **[git-pull-all](./git-pull-all)**: Sequentially pulls updates across multiple repositories (fast-forward only).
